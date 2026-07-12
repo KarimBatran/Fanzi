@@ -23,6 +23,7 @@ from telegram.ext import (
 )
 
 import database
+import health
 import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
@@ -174,6 +175,15 @@ async def checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Check cycle complete.")
 
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Live health snapshot. Restricted to ADMIN_TELEGRAM_ID, same as /checkall."""
+    if ADMIN_TELEGRAM_ID == 0 or update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    await update.message.reply_text(health.format_status_message())
+
+
 async def _post_init(application: Application) -> None:
     sched = scheduler_module.build_scheduler(application.bot)
     sched.start()
@@ -188,6 +198,10 @@ async def _post_init(application: Application) -> None:
         logger.exception("deal listener failed to start — continuing without it")
         telethon_client = None
     application.bot_data["telethon_client"] = telethon_client
+
+    # So health.json exists immediately (with real channel counts), not just
+    # after the first price-check cycle.
+    health.write_health_file()
 
 
 async def _post_shutdown(application: Application) -> None:
@@ -225,6 +239,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("mytracks", mytracks))
     application.add_handler(CommandHandler("remove", remove))
     application.add_handler(CommandHandler("checkall", checkall))
+    application.add_handler(CommandHandler("status", status))
 
     return application
 

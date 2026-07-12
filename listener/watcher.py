@@ -33,6 +33,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 
 import database
+import health
 from config import (
     ADMIN_TELEGRAM_ID,
     DEAL_CHANNELS,
@@ -96,6 +97,8 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         message = _format_message(deal, "unavailable (analysis failed)", None)
         await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
         return
+
+    health.record_deal_analyzed()
 
     if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
         return
@@ -162,12 +165,15 @@ async def start_background_listener(bot: Bot) -> TelegramClient | None:
         logger.exception("deal listener failed to connect — continuing without it")
         return None
 
+    active_count = 0
     for channel in DEAL_CHANNELS:
         try:
             await client.get_entity(channel)
             logger.info("deal listener joined channel: %s", channel)
+            active_count += 1
         except Exception:
             logger.warning("deal listener could not resolve channel: %s", channel)
+    health.set_channels_status(active=active_count, configured=len(DEAL_CHANNELS))
 
     logger.info("deal listener running in background, watching: %s", ", ".join(DEAL_CHANNELS))
     return client

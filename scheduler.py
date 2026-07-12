@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import logging
 
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from telegram import Bot
 
 import database
+import health
 from amazon.tracker import ProductFetchError, fetch_product, format_price
-from config import CHECK_INTERVAL_MINUTES
+from config import ADMIN_TELEGRAM_ID, CHECK_INTERVAL_MINUTES
 from models.tracked_product import TrackedProduct
+
+_CAIRO_TZ = ZoneInfo("Africa/Cairo")
 
 logger = logging.getLogger("fanzi.scheduler")
 
@@ -50,6 +56,8 @@ async def run_check_cycle(bot: Bot) -> None:
             database.mark_notified(product.id, current_price)
 
     logger.info("check cycle complete")
+    health.record_check_cycle_complete()
+    health.write_health_file()
 
 
 async def _send_alert(
@@ -63,10 +71,23 @@ async def _send_alert(
     )
     try:
         await bot.send_message(chat_id=telegram_id, text=message)
+        health.record_alert_sent()
     except Exception:
         logger.exception(
             "failed to send alert to telegram_id=%s for product #%d", telegram_id, product.id
         )
+
+
+async def send_daily_heartbeat(bot: Bot) -> None:
+    """Sends the same snapshot /status shows, once a day, so the admin knows
+    the bot is alive without having to ask.
+    """
+    if ADMIN_TELEGRAM_ID == 0:
+        return
+    try:
+        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=health.format_status_message())
+    except Exception:
+        logger.exception("failed to send daily heartbeat to telegram_id=%s", ADMIN_TELEGRAM_ID)
 
 
 def build_scheduler(bot: Bot) -> AsyncIOScheduler:
@@ -77,5 +98,11 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         minutes=CHECK_INTERVAL_MINUTES,
         args=[bot],
         id="price_check_cycle",
+    )
+    scheduler.add_job(
+        send_daily_heartbeat,
+        CronTrigger(hour=9, minute=0, timezone=_CAIRO_TZ),
+        args=[bot],
+        id="daily_heartbeat",
     )
     return scheduler

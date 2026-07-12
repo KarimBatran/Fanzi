@@ -10,3 +10,4 @@ playwright_profile/
 *.session
 *.session-journal
 .pytest_cache/
+health.json

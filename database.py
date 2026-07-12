@@ -167,6 +167,16 @@ def remove_product(product_id: int, user_id: int) -> bool:
         return cursor.rowcount > 0
 
 
+def set_product_active(product_id: int, user_id: int, active: bool) -> bool:
+    """Pauses/resumes a product owned by user_id. Returns False if no matching row existed."""
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE tracked_products SET active = ? WHERE id = ? AND user_id = ?",
+            (1 if active else 0, product_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
 def _row_to_user(row: sqlite3.Row) -> User:
     return User(
         id=row["id"],

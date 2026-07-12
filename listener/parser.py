@@ -136,7 +136,9 @@ async def _extract_asin_from_url(url: str, client: httpx.AsyncClient) -> str | N
 
 async def _resolve_via_redirect(url: str, client: httpx.AsyncClient) -> str | None:
     try:
-        response = await client.head(url, timeout=_REDIRECT_TIMEOUT_SECONDS)
+        # GET, not HEAD: link.amazon (and possibly other shorteners) reject
+        # HEAD requests with a 404 but resolve correctly on GET.
+        response = await client.get(url, timeout=_REDIRECT_TIMEOUT_SECONDS)
     except httpx.HTTPError:
         logger.warning("redirect resolution failed for %s", url)
         return None

@@ -11,3 +11,4 @@ playwright_profile/
 *.session-journal
 .pytest_cache/
 health.json
+data/channels.json

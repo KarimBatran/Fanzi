@@ -2,7 +2,7 @@
 direct amazon.eg links, amzn.eu/amzn.to/a.co short links, link.amazon (both
 a directly-usable path and one needing a redirect), a generic shortener
 (tinyurl.com), and the bare-ASIN-in-text fallback. No real network calls —
-httpx.AsyncClient.head/get are mocked.
+httpx.AsyncClient.get (and .get for amzn.to-style short links) are mocked.
 """
 
 from __future__ import annotations
@@ -65,11 +65,11 @@ async def test_link_amazon_9char_b0_code_follows_redirect():
     """
     with patch.object(
         httpx.AsyncClient,
-        "head",
+        "get",
         new=AsyncMock(return_value=_RedirectedResponse("https://www.amazon.eg/dp/B0REALASIN")),
-    ) as mock_head:
+    ) as mock_get:
         deal = await extract_from_post(POST_1_ADIDAS, "Mego_Reviews")
-        mock_head.assert_called_once()
+        mock_get.assert_called_once()
     assert deal is not None
     assert deal.asin == "B0REALASIN"
     assert deal.price == 2515.0
@@ -80,7 +80,7 @@ async def test_link_amazon_needs_redirect():
     """A link.amazon URL whose path isn't a plain alnum code falls back to a redirect."""
     with patch.object(
         httpx.AsyncClient,
-        "head",
+        "get",
         new=AsyncMock(return_value=_RedirectedResponse("https://www.amazon.eg/dp/B0ZZZZZZZZ")),
     ):
         text = "السعر: 999 جنيه\nhttps://link.amazon/re-direct?x=1"
@@ -92,10 +92,10 @@ async def test_link_amazon_needs_redirect():
 
 @pytest.mark.asyncio
 async def test_generic_shortener_tinyurl():
-    """Post 2 — a tinyurl.com link resolved via a mocked HEAD redirect."""
+    """Post 2 — a tinyurl.com link resolved via a mocked GET redirect."""
     with patch.object(
         httpx.AsyncClient,
-        "head",
+        "get",
         new=AsyncMock(return_value=_RedirectedResponse("https://www.amazon.eg/dp/B0VIZIOTV1")),
     ):
         deal = await extract_from_post(POST_2_VIZIO, "OffersCommunityEG")

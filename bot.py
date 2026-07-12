@@ -12,7 +12,7 @@ import sys
 # models.*) fail without this. Harmless no-op on a standard Python install.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,7 +28,26 @@ import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import ADMIN_TELEGRAM_ID, TELEGRAM_BOT_TOKEN
+from listener import watcher as listener_watcher
 from listener.watcher import start_background_listener
+
+PUBLIC_COMMANDS = [
+    BotCommand("start", "Welcome & quick start guide"),
+    BotCommand("track", "Track a new Amazon.eg product"),
+    BotCommand("mytracks", "View your tracked products"),
+    BotCommand("remove", "Remove a tracked product"),
+    BotCommand("pause", "Pause tracking a product"),
+    BotCommand("resume", "Resume tracking a product"),
+    BotCommand("help", "How to use Fanzi"),
+]
+
+ADMIN_ONLY_COMMANDS = [
+    BotCommand("status", "Bot health & stats"),
+    BotCommand("checkall", "Trigger a manual price check"),
+    BotCommand("channels", "List watched deal channels"),
+    BotCommand("addchannel", "Add a new deal channel"),
+    BotCommand("removechannel", "Remove a deal channel"),
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs full request URLs at INFO, which embeds the bot token
@@ -162,6 +181,97 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"No tracked product #{product_id} found for you.")
 
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Fanzi tracks Amazon.eg product prices and alerts you when they drop.\n\n"
+        "/track — start tracking a product\n"
+        "/mytracks — see what you're tracking\n"
+        "/pause [id] — pause a tracked product (stops price checks/alerts)\n"
+        "/resume [id] — resume a paused product\n"
+        "/remove [id] — stop tracking a product for good\n\n"
+        "Use the id shown next to each product in /mytracks."
+    )
+
+
+async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /pause [id] (see the id from /mytracks)")
+        return
+    try:
+        product_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /pause [id] — id must be a number.")
+        return
+
+    user = database.get_or_create_user(update.effective_user.id, update.effective_user.username)
+    if database.set_product_active(product_id, user.id, active=False):
+        await update.message.reply_text(f"⏸ Paused #{product_id}.")
+    else:
+        await update.message.reply_text(f"No tracked product #{product_id} found for you.")
+
+
+async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /resume [id] (see the id from /mytracks)")
+        return
+    try:
+        product_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Usage: /resume [id] — id must be a number.")
+        return
+
+    user = database.get_or_create_user(update.effective_user.id, update.effective_user.username)
+    if database.set_product_active(product_id, user.id, active=True):
+        await update.message.reply_text(f"▶️ Resumed #{product_id}.")
+    else:
+        await update.message.reply_text(f"No tracked product #{product_id} found for you.")
+
+
+def _is_admin(update: Update) -> bool:
+    return ADMIN_TELEGRAM_ID != 0 and update.effective_user.id == ADMIN_TELEGRAM_ID
+
+
+async def channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    statuses = await listener_watcher.get_channel_statuses()
+    if not statuses:
+        await update.message.reply_text("The deal listener isn't running — no channels to show.")
+        return
+
+    active_count = sum(1 for _, ok in statuses if ok)
+    lines = [f"📡 Watched Channels ({active_count}/{len(statuses)} active)", ""]
+    for channel_name, ok in statuses:
+        lines.append(f"✅ {channel_name}" if ok else f"❌ {channel_name} (failed to join)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /addchannel @username")
+        return
+
+    _, reply = await listener_watcher.add_channel_runtime(context.args[0])
+    await update.message.reply_text(reply)
+
+
+async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removechannel @username")
+        return
+
+    _, reply = await listener_watcher.remove_channel_runtime(context.args[0])
+    await update.message.reply_text(reply)
+
+
 async def checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually triggers one scheduler check cycle. Restricted to
     ADMIN_TELEGRAM_ID so it can't be abused if the bot is ever shared.
@@ -185,6 +295,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _post_init(application: Application) -> None:
+    await application.bot.set_my_commands(PUBLIC_COMMANDS)
+    if ADMIN_TELEGRAM_ID != 0:
+        await application.bot.set_my_commands(
+            PUBLIC_COMMANDS + ADMIN_ONLY_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=ADMIN_TELEGRAM_ID),
+        )
+    logger.info(
+        "command menu registered (admin scope: %s)", "enabled" if ADMIN_TELEGRAM_ID else "disabled"
+    )
+
     sched = scheduler_module.build_scheduler(application.bot)
     sched.start()
     application.bot_data["scheduler"] = sched
@@ -238,8 +358,14 @@ def build_application() -> Application:
     application.add_handler(track_conversation)
     application.add_handler(CommandHandler("mytracks", mytracks))
     application.add_handler(CommandHandler("remove", remove))
+    application.add_handler(CommandHandler("pause", pause))
+    application.add_handler(CommandHandler("resume", resume))
+    application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("checkall", checkall))
     application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("channels", channels))
+    application.add_handler(CommandHandler("addchannel", addchannel))
+    application.add_handler(CommandHandler("removechannel", removechannel))
 
     return application
 

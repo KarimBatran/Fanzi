@@ -31,18 +31,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telegram import Bot
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.tl.functions.channels import JoinChannelRequest
 
 import database
 import health
 from config import (
     ADMIN_TELEGRAM_ID,
-    DEAL_CHANNELS,
     MIN_DEAL_QUALITY,
     TELEGRAM_BOT_TOKEN,
     TELETHON_API_HASH,
     TELETHON_API_ID,
     TELETHON_SESSION_NAME,
 )
+from listener import channels_store
 from listener.analyzer import analyze_deal, meets_min_quality
 from listener.auto_tracker import auto_add_if_qualifying
 from listener.parser import ParsedDeal, extract_from_post
@@ -50,6 +51,14 @@ from listener.parser import ParsedDeal, extract_from_post
 logger = logging.getLogger("fanzi.listener.watcher")
 
 _QUALITY_EMOJI = {"great": "🔥", "good": "✅", "average": "🤷", "skip": "⏭️"}
+
+# Module-level handle on the live client/handler so admin commands (/channels,
+# /addchannel, /removechannel) can inspect and update the running listener
+# without restarting bot.py. None when the listener isn't running.
+_client: TelegramClient | None = None
+_bot: Bot | None = None
+_message_handler = None
+_watched_channels: list[str] = []
 
 
 def _strip_affiliate_tag(url: str) -> str:
@@ -153,7 +162,10 @@ async def start_background_listener(bot: Bot) -> TelegramClient | None:
     disabled/unavailable. Never raises — every failure is logged and
     treated as "listener unavailable", so it can never take the bot down.
     """
-    if not TELETHON_API_ID or not DEAL_CHANNELS:
+    global _client, _bot, _message_handler, _watched_channels
+
+    channels = channels_store.get_effective_channels()
+    if not TELETHON_API_ID or not channels:
         logger.info("deal listener disabled (TELETHON_API_ID/DEAL_CHANNELS not configured)")
         return None
 
@@ -165,8 +177,14 @@ async def start_background_listener(bot: Bot) -> TelegramClient | None:
         )
         return None
 
-    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH)
-    client.add_event_handler(_make_message_handler(bot), events.NewMessage(chats=DEAL_CHANNELS))
+    # catch_up=True: on connect, replay any updates missed while disconnected
+    # (and any pts-gap-recovered updates on busy channels) as real events
+    # instead of silently absorbing them into internal state with no
+    # dispatch to our handler. This SDK version takes it on the client
+    # constructor, not on .start().
+    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH, catch_up=True)
+    handler = _make_message_handler(bot)
+    client.add_event_handler(handler, events.NewMessage(chats=channels))
 
     try:
         await client.start()
@@ -174,36 +192,115 @@ async def start_background_listener(bot: Bot) -> TelegramClient | None:
         logger.exception("deal listener failed to connect — continuing without it")
         return None
 
-    active_count = 0
-    for channel in DEAL_CHANNELS:
+    _client = client
+    _bot = bot
+    _message_handler = handler
+    _watched_channels = channels
+
+    statuses = await _check_channel_statuses(client, channels)
+    active_count = sum(1 for _, ok in statuses if ok)
+    health.set_channels_status(active=active_count, configured=len(channels))
+
+    logger.info("deal listener running in background, watching: %s", ", ".join(channels))
+    return client
+
+
+async def _check_channel_statuses(client: TelegramClient, channels: list[str]) -> list[tuple[str, bool]]:
+    """Live-resolves each channel and returns [(channel, ok), ...], logging as it goes."""
+    results: list[tuple[str, bool]] = []
+    for channel in channels:
         try:
             await client.get_entity(channel)
             logger.info("deal listener joined channel: %s", channel)
-            active_count += 1
+            results.append((channel, True))
         except Exception:
             logger.warning("deal listener could not resolve channel: %s", channel)
-    health.set_channels_status(active=active_count, configured=len(DEAL_CHANNELS))
+            results.append((channel, False))
+    return results
 
-    logger.info("deal listener running in background, watching: %s", ", ".join(DEAL_CHANNELS))
-    return client
+
+async def get_channel_statuses() -> list[tuple[str, bool]]:
+    """Live status for /channels. Empty list if the listener isn't running."""
+    if _client is None:
+        return []
+    return await _check_channel_statuses(_client, _watched_channels)
+
+
+async def _resubscribe() -> None:
+    """Re-registers the message handler with the current effective channel
+    list — how add/remove take effect immediately on the running client.
+    """
+    global _message_handler, _watched_channels
+    assert _client is not None and _bot is not None
+    if _message_handler is not None:
+        _client.remove_event_handler(_message_handler)
+    channels = channels_store.get_effective_channels()
+    handler = _make_message_handler(_bot)
+    _client.add_event_handler(handler, events.NewMessage(chats=channels))
+    _message_handler = handler
+    _watched_channels = channels
+
+    statuses = await _check_channel_statuses(_client, channels)
+    active_count = sum(1 for _, ok in statuses if ok)
+    health.set_channels_status(active=active_count, configured=len(channels))
+
+
+async def add_channel_runtime(channel: str) -> tuple[bool, str]:
+    """Validates, joins, persists, and subscribes to a new channel on the
+    live listener — no restart needed. Returns (success, reply_text).
+    """
+    if _client is None:
+        return False, "Listener isn't running — check the logs."
+
+    channel = channel.lstrip("@").strip()
+    try:
+        entity = await _client.get_entity(channel)
+    except Exception:
+        logger.warning("addchannel: could not resolve %s", channel)
+        return False, "❌ Couldn't find that channel — check the username and try again"
+
+    try:
+        await _client(JoinChannelRequest(entity))
+    except Exception:
+        # Already joined, or the channel restricts joining — either way we
+        # can still receive updates if the entity resolved; don't fail here.
+        logger.warning("addchannel: JoinChannelRequest failed for %s — continuing anyway", channel)
+
+    channels_store.add_channel(channel)
+    await _resubscribe()
+    logger.info("addchannel: now watching %s", channel)
+    return True, f"✅ Now watching @{channel}"
+
+
+async def remove_channel_runtime(channel: str) -> tuple[bool, str]:
+    if _client is None:
+        return False, "Listener isn't running — check the logs."
+
+    channel = channel.lstrip("@").strip()
+    channels_store.remove_channel(channel)
+    await _resubscribe()
+    logger.info("removechannel: stopped watching %s", channel)
+    return True, f"✅ Stopped watching @{channel}"
 
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    if not DEAL_CHANNELS:
-        logger.warning("DEAL_CHANNELS is empty — listener has nothing to watch")
+    channels = channels_store.get_effective_channels()
+    if not channels:
+        logger.warning("no deal channels configured — listener has nothing to watch")
 
     database.init_db()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH)
-    client.add_event_handler(_make_message_handler(bot), events.NewMessage(chats=DEAL_CHANNELS))
+    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH, catch_up=True)
+    client.add_event_handler(_make_message_handler(bot), events.NewMessage(chats=channels))
 
     # Standalone run — this is the one place allowed to prompt interactively
-    # for phone/OTP when no session file exists yet.
+    # for phone/OTP when no session file exists yet. catch_up=True: see the
+    # comment in start_background_listener() above.
     await client.start()
-    logger.info("Fanzi deal listener started, watching: %s", ", ".join(DEAL_CHANNELS))
+    logger.info("Fanzi deal listener started, watching: %s", ", ".join(channels))
     await client.run_until_disconnected()
 
 

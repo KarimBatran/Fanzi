@@ -28,7 +28,7 @@ from urllib.parse import urlsplit, urlunsplit
 # sys.path in that case).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -43,9 +43,8 @@ from config import (
     TELETHON_API_ID,
     TELETHON_SESSION_NAME,
 )
-from listener import channels_store, dedup
+from listener import channels_store, dedup, pending_deals
 from listener.analyzer import analyze_deal, meets_min_quality
-from listener.auto_tracker import auto_add_if_qualifying
 from listener.parser import ParsedDeal, extract_from_post
 
 logger = logging.getLogger("fanzi.listener.watcher")
@@ -69,21 +68,24 @@ def _strip_affiliate_tag(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query_pairs), ""))
 
 
-def _format_message(deal: ParsedDeal, verdict_text: str, status_line: str | None) -> str:
+def _format_message(deal: ParsedDeal, verdict_text: str, clean_url: str) -> str:
     discount_badge = f" (-{deal.discount_percent}%)" if deal.discount_percent else ""
-    clean_url = _strip_affiliate_tag(deal.url) if deal.url else f"https://www.amazon.eg/dp/{deal.asin}"
     lines = [
         f"🔍 Deal from @{deal.channel_name}",
         "",
         deal.title,
         f"💰 {deal.price:g} EGP{discount_badge}",
         f"📊 Verdict: {verdict_text}",
+        "",
+        clean_url,
     ]
-    if status_line:
-        lines.append(status_line)
-    lines.append("")
-    lines.append(clean_url)
     return "\n".join(lines)
+
+
+def _track_button(asin: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📉 Track Price", callback_data=f"track:{asin}")]]
+    )
 
 
 async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
@@ -106,12 +108,8 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         logger.info("[%s] duplicate window expired — reprocessing", channel_name)
     dedup.mark_seen(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
 
-    already_tracked = (
-        database.get_tracked_product_by_asin(
-            database.get_or_create_user(ADMIN_TELEGRAM_ID, None).id, deal.asin
-        )
-        is not None
-    )
+    clean_url = _strip_affiliate_tag(deal.url) if deal.url else f"https://www.amazon.eg/dp/{deal.asin}"
+    pending_deals.store(deal.asin, deal.title, clean_url, deal.price, deal.discount_percent)
 
     price_history = database.get_latest_price_for_asin(deal.asin)
     verdict = await analyze_deal(deal, price_history)
@@ -119,8 +117,8 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     if verdict is None:
         logger.info("[%s] Gemini unavailable — forwarding without verdict", channel_name)
         # Analysis API failed/skipped — forward the raw deal without a verdict rather than dropping it.
-        message = _format_message(deal, "unavailable (analysis failed)", None)
-        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+        message = _format_message(deal, "unavailable (analysis failed)", clean_url)
+        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
         logger.info("[%s] Forwarding to admin", channel_name)
         return
 
@@ -131,19 +129,11 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
         return
 
-    status_line = None
-    if already_tracked:
-        status_line = "👁 Already tracking this"
-    else:
-        outcome = auto_add_if_qualifying(deal, verdict)
-        if outcome == "added":
-            status_line = f"✅ Added to tracker (target: {verdict.suggested_target:g} EGP)"
-
     emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
     verdict_text = f"{emoji} {verdict.reason}"
-    message = _format_message(deal, verdict_text, status_line)
+    message = _format_message(deal, verdict_text, clean_url)
     logger.info("[%s] Forwarding to admin", channel_name)
-    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
 
 
 def _make_message_handler(bot: Bot):

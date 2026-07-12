@@ -197,6 +197,16 @@ def set_product_active(product_id: int, user_id: int, active: bool) -> bool:
         return cursor.rowcount > 0
 
 
+def delete_all_tracked_products() -> int:
+    """One-time reset for the explicit-tracking UX migration: wipes every
+    tracked product for every user, leaving My Tracks empty. Doesn't touch
+    users, gemini_quota, or duplicate_deals.
+    """
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM tracked_products")
+        return cursor.rowcount
+
+
 def get_gemini_quota_count(quota_date: str) -> int:
     with get_connection() as conn:
         row = conn.execute(

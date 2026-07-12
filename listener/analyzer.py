@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 
-from groq import AsyncGroq
+from groq import AsyncGroq, APIStatusError
 
 from config import GROQ_API_KEY
 from listener.parser import ParsedDeal
@@ -14,6 +14,7 @@ from listener.parser import ParsedDeal
 logger = logging.getLogger("fanzi.listener.analyzer")
 
 _MODEL = "llama-3.1-8b-instant"
+_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 _SYSTEM_PROMPT = (
     "You are a deal analyst for Amazon Egypt. You receive a product deal post "
@@ -67,8 +68,25 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
                 {"role": "user", "content": user_content},
             ],
         )
+    except APIStatusError as exc:
+        # Surface enough detail (status, body, Cloudflare/request ID, endpoint)
+        # to diagnose network/WAF-level failures without needing an ad-hoc
+        # script — these show up as generic SDK exceptions otherwise.
+        ray_id = exc.response.headers.get("cf-ray") if exc.response is not None else None
+        request_id = exc.response.headers.get("x-request-id") if exc.response is not None else None
+        logger.error(
+            "deal analysis failed for ASIN %s: endpoint=%s status=%s ray_id=%s "
+            "request_id=%s body=%s",
+            deal.asin,
+            _ENDPOINT,
+            exc.status_code,
+            ray_id,
+            request_id,
+            exc.response.text if exc.response is not None else None,
+        )
+        return None
     except Exception:
-        logger.exception("deal analysis failed for ASIN %s", deal.asin)
+        logger.exception("deal analysis failed for ASIN %s (endpoint=%s)", deal.asin, _ENDPOINT)
         return None
     finally:
         await client.close()

@@ -5,13 +5,16 @@ extraction rule never gets duplicated.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import httpx
 
+logger = logging.getLogger("fanzi.amazon.parser")
+
 _BARE_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 _PATH_ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
-_SHORT_LINK_HOSTS = ("amzn.eu", "amzn.to")
+_SHORT_LINK_HOSTS = ("amzn.eu", "amzn.to", "a.co")
 
 
 def normalize_product_url(asin: str) -> str:
@@ -50,7 +53,8 @@ async def _resolve_short_link(url: str, http_client: httpx.AsyncClient | None) -
     try:
         response = await client.get(url)
         return str(response.url)
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.warning("short-link resolution failed for %s: %s", url, exc)
         return None
     finally:
         if owns_client:

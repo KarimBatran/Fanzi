@@ -27,6 +27,7 @@ import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import ADMIN_TELEGRAM_ID, TELEGRAM_BOT_TOKEN
+from listener.watcher import start_background_listener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs full request URLs at INFO, which embeds the bot token
@@ -179,12 +180,26 @@ async def _post_init(application: Application) -> None:
     application.bot_data["scheduler"] = sched
     logger.info("scheduler started (interval-based background job)")
 
+    # Deal listener runs invisibly alongside the bot — any failure here must
+    # never prevent the bot itself from starting.
+    try:
+        telethon_client = await start_background_listener(application.bot)
+    except Exception:
+        logger.exception("deal listener failed to start — continuing without it")
+        telethon_client = None
+    application.bot_data["telethon_client"] = telethon_client
+
 
 async def _post_shutdown(application: Application) -> None:
     sched = application.bot_data.get("scheduler")
     if sched is not None:
         sched.shutdown(wait=False)
         logger.info("scheduler stopped")
+
+    telethon_client = application.bot_data.get("telethon_client")
+    if telethon_client is not None:
+        await telethon_client.disconnect()
+        logger.info("deal listener stopped")
 
 
 def build_application() -> Application:

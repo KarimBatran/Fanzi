@@ -90,6 +90,32 @@ def add_tracked_product(
         return _row_to_product(row)
 
 
+def get_tracked_product_by_asin(user_id: int, asin: str) -> TrackedProduct | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM tracked_products WHERE user_id = ? AND asin = ? AND active = 1",
+            (user_id, asin),
+        ).fetchone()
+        return _row_to_product(row) if row else None
+
+
+def get_latest_price_for_asin(asin: str) -> float | None:
+    """Most recently checked price for this ASIN across all users' tracked
+    products — used as lightweight price history for deal analysis, since
+    there is no dedicated price_points table.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT current_price FROM tracked_products
+            WHERE asin = ? AND current_price IS NOT NULL
+            ORDER BY last_checked DESC, created_at DESC LIMIT 1
+            """,
+            (asin,),
+        ).fetchone()
+        return row["current_price"] if row else None
+
+
 def get_active_products(user_id: int) -> list[TrackedProduct]:
     with get_connection() as conn:
         rows = conn.execute(

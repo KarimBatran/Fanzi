@@ -7,3 +7,6 @@ venv/
 *.db-journal
 *.log
 playwright_profile/
+*.session
+*.session-journal
+.pytest_cache/

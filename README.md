@@ -18,6 +18,32 @@ copy .env.example .env   # then fill in TELEGRAM_BOT_TOKEN from @BotFather
 python bot.py
 ```
 
+`python bot.py` is the only command needed for normal operation — it starts the bot, the
+price-check scheduler, and the deal listener together in one process.
+
+**One-time exception:** if you're enabling the deal listener (`TELETHON_API_ID`/`DEAL_CHANNELS`
+below) for the first time, there's no Telegram session yet, so `bot.py` will log a warning and
+skip starting the listener. Run `python listener\watcher.py` once, complete the interactive phone
+number + OTP login it prompts for, then stop it (Ctrl+C) and go back to running `python bot.py` —
+the saved session file lets it start silently from then on.
+
+## Configuration
+
+All settings come from `.env` (copy `.env.example`) — see that file for the full list with
+where-to-get-it comments. Summary:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | yes | The bot's Telegram API token, from @BotFather. |
+| `DATABASE_PATH` | no (default `fanzi.db`) | SQLite file path. |
+| `CHECK_INTERVAL_MINUTES` | no (default `60`) | How often the scheduler re-checks tracked prices. |
+| `ADMIN_TELEGRAM_ID` | no | Your Telegram user ID; restricts `/checkall`. |
+| `TELETHON_API_ID` / `TELETHON_API_HASH` | no | From my.telegram.org — enables the deal listener. Leave unset to disable it entirely. |
+| `TELETHON_SESSION_NAME` | no (default `fanzi_listener`) | Telethon session file name. |
+| `DEAL_CHANNELS` | no | Comma-separated public channel usernames the listener watches. |
+| `GROQ_API_KEY` | no | Groq API key (free tier) used to grade forwarded deals. |
+| `MIN_DEAL_QUALITY` | no (default `good`) | Minimum verdict (`good` or `great`) to forward/auto-track a deal. |
+
 ## Status
 
 - Milestone 1: scaffold, database, `/start`, `/track` (price fetch mocked), `/mytracks`, `/remove`.
@@ -27,3 +53,7 @@ python bot.py
 - Milestone 3: APScheduler background job (`CHECK_INTERVAL_MINUTES`, default 60) that checks all
   active products, updates prices, and sends dedup'd price-drop alerts. `/checkall` (restricted to
   `ADMIN_TELEGRAM_ID`) triggers a cycle manually for testing.
+- Deal aggregator: a Telethon-based listener (`listener/`) watches public Amazon-deal Telegram
+  channels, parses each post (Arabic/English, several link formats), gets a Groq-generated quality
+  verdict, auto-tracks qualifying deals, and forwards a verdict summary to `ADMIN_TELEGRAM_ID`.
+  Runs invisibly as a background task inside `bot.py` — see Setup above for first-time login.

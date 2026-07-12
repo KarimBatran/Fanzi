@@ -1,0 +1,196 @@
+"""Telethon client watching configured public deal channels. Parses each
+post, gets a Groq verdict, auto-tracks qualifying deals, and forwards a
+verdict summary to ADMIN_TELEGRAM_ID via the existing bot.
+
+Two entry points:
+- `start_background_listener(bot)` — embedded in bot.py's own event loop.
+  Never prompts for interactive login; if no session file exists yet it
+  logs instructions and returns None (listener disabled) rather than
+  hanging bot.py waiting for console input.
+- `main()` / `python listener\\watcher.py` — standalone script. Used for
+  the one-time interactive Telethon login (phone + OTP) that creates the
+  session file, and can also run the listener stand-alone afterwards.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from urllib.parse import urlsplit, urlunsplit
+
+# Same embeddable-Python sys.path workaround as bot.py (see the comment
+# there): needed so `python listener\watcher.py` (standalone) can resolve
+# top-level imports (database, config, amazon.*) from the fanzi/ directory,
+# two levels up from this file. Harmless no-op on a standard CPython install,
+# and a no-op when this module is imported by bot.py (fanzi/ is already on
+# sys.path in that case).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from telegram import Bot
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
+
+import database
+from config import (
+    ADMIN_TELEGRAM_ID,
+    DEAL_CHANNELS,
+    MIN_DEAL_QUALITY,
+    TELEGRAM_BOT_TOKEN,
+    TELETHON_API_HASH,
+    TELETHON_API_ID,
+    TELETHON_SESSION_NAME,
+)
+from listener.analyzer import analyze_deal, meets_min_quality
+from listener.auto_tracker import auto_add_if_qualifying
+from listener.parser import ParsedDeal, extract_from_post
+
+logger = logging.getLogger("fanzi.listener.watcher")
+
+_QUALITY_EMOJI = {"great": "🔥", "good": "✅", "average": "🤷", "skip": "⏭️"}
+
+
+def _strip_affiliate_tag(url: str) -> str:
+    parts = urlsplit(url)
+    query_pairs = [
+        pair for pair in parts.query.split("&") if pair and not pair.startswith("tag=")
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query_pairs), ""))
+
+
+def _format_message(deal: ParsedDeal, verdict_text: str, status_line: str | None) -> str:
+    discount_badge = f" (-{deal.discount_percent}%)" if deal.discount_percent else ""
+    clean_url = _strip_affiliate_tag(deal.url) if deal.url else f"https://www.amazon.eg/dp/{deal.asin}"
+    lines = [
+        f"🔍 Deal from @{deal.channel_name}",
+        "",
+        deal.title,
+        f"💰 {deal.price:g} EGP{discount_badge}",
+        f"📊 Verdict: {verdict_text}",
+    ]
+    if status_line:
+        lines.append(status_line)
+    lines.append("")
+    lines.append(clean_url)
+    return "\n".join(lines)
+
+
+async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
+    deal = await extract_from_post(text, channel_name)
+    if deal is None:
+        return
+
+    already_tracked = (
+        database.get_tracked_product_by_asin(
+            database.get_or_create_user(ADMIN_TELEGRAM_ID, None).id, deal.asin
+        )
+        is not None
+    )
+
+    price_history = database.get_latest_price_for_asin(deal.asin)
+    verdict = await analyze_deal(deal, price_history)
+
+    if verdict is None:
+        # Analysis API failed — forward the raw deal without a verdict rather than dropping it.
+        message = _format_message(deal, "unavailable (analysis failed)", None)
+        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+        return
+
+    if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
+        return
+
+    status_line = None
+    if already_tracked:
+        status_line = "👁 Already tracking this"
+    else:
+        outcome = auto_add_if_qualifying(deal, verdict)
+        if outcome == "added":
+            status_line = f"✅ Added to tracker (target: {verdict.suggested_target:g} EGP)"
+
+    emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
+    verdict_text = f"{emoji} {verdict.reason}"
+    message = _format_message(deal, verdict_text, status_line)
+    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+
+
+def _make_message_handler(bot: Bot):
+    async def _on_message(event: events.NewMessage.Event) -> None:
+        channel = await event.get_chat()
+        channel_name = getattr(channel, "username", None) or getattr(channel, "title", "unknown")
+        text = event.message.message or ""
+        try:
+            await _handle_post(bot, text, channel_name)
+        except FloodWaitError as exc:
+            logger.warning("FloodWaitError — sleeping %ds", exc.seconds)
+            await asyncio.sleep(exc.seconds)
+        except Exception:
+            logger.exception("error handling post from @%s", channel_name)
+
+    return _on_message
+
+
+def _session_file_path() -> str:
+    return f"{TELETHON_SESSION_NAME}.session"
+
+
+async def start_background_listener(bot: Bot) -> TelegramClient | None:
+    """Starts the listener as a connection on the caller's existing asyncio
+    event loop. Returns the connected TelegramClient (caller owns its
+    lifetime — disconnect it on shutdown), or None if the listener is
+    disabled/unavailable. Never raises — every failure is logged and
+    treated as "listener unavailable", so it can never take the bot down.
+    """
+    if not TELETHON_API_ID or not DEAL_CHANNELS:
+        logger.info("deal listener disabled (TELETHON_API_ID/DEAL_CHANNELS not configured)")
+        return None
+
+    if not os.path.isfile(_session_file_path()):
+        logger.warning(
+            "No Telethon session found for the deal listener. Run "
+            r"'python listener\watcher.py' once to complete Telegram login, "
+            "then restart bot.py. Deal listener is disabled for this run."
+        )
+        return None
+
+    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH)
+    client.add_event_handler(_make_message_handler(bot), events.NewMessage(chats=DEAL_CHANNELS))
+
+    try:
+        await client.start()
+    except Exception:
+        logger.exception("deal listener failed to connect — continuing without it")
+        return None
+
+    for channel in DEAL_CHANNELS:
+        try:
+            await client.get_entity(channel)
+            logger.info("deal listener joined channel: %s", channel)
+        except Exception:
+            logger.warning("deal listener could not resolve channel: %s", channel)
+
+    logger.info("deal listener running in background, watching: %s", ", ".join(DEAL_CHANNELS))
+    return client
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    if not DEAL_CHANNELS:
+        logger.warning("DEAL_CHANNELS is empty — listener has nothing to watch")
+
+    database.init_db()
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    client = TelegramClient(TELETHON_SESSION_NAME, TELETHON_API_ID, TELETHON_API_HASH)
+    client.add_event_handler(_make_message_handler(bot), events.NewMessage(chats=DEAL_CHANNELS))
+
+    # Standalone run — this is the one place allowed to prompt interactively
+    # for phone/OTP when no session file exists yet.
+    await client.start()
+    logger.info("Fanzi deal listener started, watching: %s", ", ".join(DEAL_CHANNELS))
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

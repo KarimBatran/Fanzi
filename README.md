@@ -41,8 +41,12 @@ where-to-get-it comments. Summary:
 | `TELETHON_API_ID` / `TELETHON_API_HASH` | no | From my.telegram.org — enables the deal listener. Leave unset to disable it entirely. |
 | `TELETHON_SESSION_NAME` | no (default `fanzi_listener`) | Telethon session file name. |
 | `DEAL_CHANNELS` | no | Comma-separated public channel usernames the listener watches. |
-| `GROQ_API_KEY` | no | Groq API key (free tier) used to grade forwarded deals. |
+| `GEMINI_API_KEY` | no | Google Gemini API key (free tier) used to grade forwarded deals. |
 | `MIN_DEAL_QUALITY` | no (default `good`) | Minimum verdict (`good` or `great`) to forward/auto-track a deal. |
+| `RATE_LIMIT_PER_MIN` | no (default `12`) | Max Gemini calls per minute; extra requests wait for a slot. |
+| `DAILY_ANALYSIS_CAP` | no (default `1400`) | Max Gemini calls per day; resets at local midnight. |
+| `MIN_DISCOUNT_FOR_ANALYSIS` | no (default `10`) | Posts with a lower detected discount skip Gemini entirely. |
+| `DUPLICATE_WINDOW_HOURS` | no (default `24`) | How long the same product from the same channel is suppressed as a duplicate. |
 
 ## Status
 
@@ -54,6 +58,8 @@ where-to-get-it comments. Summary:
   active products, updates prices, and sends dedup'd price-drop alerts. `/checkall` (restricted to
   `ADMIN_TELEGRAM_ID`) triggers a cycle manually for testing.
 - Deal aggregator: a Telethon-based listener (`listener/`) watches public Amazon-deal Telegram
-  channels, parses each post (Arabic/English, several link formats), gets a Groq-generated quality
+  channels, parses each post (Arabic/English, several link formats), gets a Gemini-generated quality
   verdict, auto-tracks qualifying deals, and forwards a verdict summary to `ADMIN_TELEGRAM_ID`.
   Runs invisibly as a background task inside `bot.py` — see Setup above for first-time login.
+  Gemini calls are quota-managed (`listener/analyzer.py`'s `QuotaGuard`): rate-limited per minute,
+  capped per day, and skipped for low-discount or duplicate posts to stay within the free tier.

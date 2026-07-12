@@ -1,5 +1,5 @@
 """Telethon client watching configured public deal channels. Parses each
-post, gets a Groq verdict, auto-tracks qualifying deals, and forwards a
+post, gets a Gemini verdict, auto-tracks qualifying deals, and forwards a
 verdict summary to ADMIN_TELEGRAM_ID via the existing bot.
 
 Two entry points:
@@ -43,7 +43,7 @@ from config import (
     TELETHON_API_ID,
     TELETHON_SESSION_NAME,
 )
-from listener import channels_store
+from listener import channels_store, dedup
 from listener.analyzer import analyze_deal, meets_min_quality
 from listener.auto_tracker import auto_add_if_qualifying
 from listener.parser import ParsedDeal, extract_from_post
@@ -95,6 +95,12 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         return
     logger.info("[%s] ASIN extracted: %s", channel_name, deal.asin)
 
+    if dedup.is_duplicate(channel_name, deal.asin, deal.title):
+        logger.info("[%s] duplicate deal skipped", channel_name)
+        health.record_duplicate_skipped()
+        return
+    dedup.mark_seen(channel_name, deal.asin, deal.title)
+
     already_tracked = (
         database.get_tracked_product_by_asin(
             database.get_or_create_user(ADMIN_TELEGRAM_ID, None).id, deal.asin
@@ -106,14 +112,14 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     verdict = await analyze_deal(deal, price_history)
 
     if verdict is None:
-        logger.info("[%s] Groq failed — forwarding without verdict", channel_name)
-        # Analysis API failed — forward the raw deal without a verdict rather than dropping it.
+        logger.info("[%s] Gemini unavailable — forwarding without verdict", channel_name)
+        # Analysis API failed/skipped — forward the raw deal without a verdict rather than dropping it.
         message = _format_message(deal, "unavailable (analysis failed)", None)
         await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
         logger.info("[%s] Forwarding to admin", channel_name)
         return
 
-    logger.info("[%s] Groq verdict: %s — %s", channel_name, verdict.deal_quality, verdict.reason)
+    logger.info("[%s] Gemini verdict: %s — %s", channel_name, verdict.deal_quality, verdict.reason)
     health.record_deal_analyzed()
 
     if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):

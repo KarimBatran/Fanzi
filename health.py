@@ -13,6 +13,7 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
+from listener import analyzer as deal_analyzer
 
 HEALTH_FILE_PATH = "health.json"
 
@@ -22,16 +23,18 @@ _channels_configured = 0
 _channels_active = 0
 _deals_analyzed_today = 0
 _alerts_sent_today = 0
+_duplicates_skipped_today = 0
 _counters_date = date.today()
 
 
 def _reset_counters_if_new_day() -> None:
-    global _counters_date, _deals_analyzed_today, _alerts_sent_today
+    global _counters_date, _deals_analyzed_today, _alerts_sent_today, _duplicates_skipped_today
     today = date.today()
     if today != _counters_date:
         _counters_date = today
         _deals_analyzed_today = 0
         _alerts_sent_today = 0
+        _duplicates_skipped_today = 0
 
 
 def record_deal_analyzed() -> None:
@@ -44,6 +47,12 @@ def record_alert_sent() -> None:
     global _alerts_sent_today
     _reset_counters_if_new_day()
     _alerts_sent_today += 1
+
+
+def record_duplicate_skipped() -> None:
+    global _duplicates_skipped_today
+    _reset_counters_if_new_day()
+    _duplicates_skipped_today += 1
 
 
 def set_channels_status(active: int, configured: int) -> None:
@@ -81,6 +90,7 @@ def build_snapshot() -> dict:
     last_check_seconds_ago = (
         int((datetime.now() - _last_check).total_seconds()) if _last_check is not None else None
     )
+    quota = deal_analyzer.get_quota_status()
     return {
         "status": "delayed" if _is_delayed() else "ok",
         "uptime_seconds": _uptime_seconds(),
@@ -91,6 +101,10 @@ def build_snapshot() -> dict:
         "channels_configured": _channels_configured,
         "deals_today": _deals_analyzed_today,
         "alerts_today": _alerts_sent_today,
+        "duplicates_skipped_today": _duplicates_skipped_today,
+        "gemini_calls_today": quota["daily_count"],
+        "gemini_daily_cap": quota["daily_cap"],
+        "gemini_calls_this_minute": quota["minute_count"],
         "pid": os.getpid(),
     }
 
@@ -131,6 +145,9 @@ def format_status_message() -> str:
         f"📡 Channels: {snapshot['channels_active']}/{snapshot['channels_configured']} listening",
         f"🤖 Deals analyzed today: {snapshot['deals_today']}",
         f"💸 Alerts sent today: {snapshot['alerts_today']}",
+        f"🧠 Gemini calls today: {snapshot['gemini_calls_today']}/{snapshot['gemini_daily_cap']}",
+        f"   ({snapshot['gemini_calls_this_minute']} in the last minute, "
+        f"{snapshot['duplicates_skipped_today']} duplicates skipped today)",
     ]
     if delayed:
         lines.append("")

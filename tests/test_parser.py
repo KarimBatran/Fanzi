@@ -133,3 +133,40 @@ async def test_bare_asin_fallback_no_url():
     assert deal is not None
     assert deal.asin == "B0E48L1WU"
     assert deal.price == 2515.0
+
+
+@pytest.mark.asyncio
+async def test_price_bare_preposition_no_currency_word():
+    """"ب<number>" with no "سعر" and no currency word at all (e.g. "ب37428")
+    is extremely common on real deal channels and was previously dropped
+    entirely — a live-channel diagnosis found real Amazon deals (valid ASIN
+    links) on LQoffers/Mego_Reviews silently failing at the parse stage
+    purely because of this phrasing.
+    """
+    text = "تلاجة من Ocean بسعة 625 لتر ب37428\nhttps://www.amazon.eg/dp/B0FRIDGE01"
+    deal = await extract_from_post(text, "LQoffers")
+    assert deal is not None
+    assert deal.asin == "B0FRIDGE01"
+    assert deal.price == 37428.0
+
+
+@pytest.mark.asyncio
+async def test_price_bare_preposition_with_tatweel_and_space():
+    """Same "ب<number>" phrasing but with elongation characters (تطويل) and
+    a space before the digits: "بــــ 129".
+    """
+    text = "حلاوة طحينية الرشيدي الميزان 900جم بــــ 129\nhttps://www.amazon.eg/dp/B0HALAWA01"
+    deal = await extract_from_post(text, "Mego_Reviews")
+    assert deal is not None
+    assert deal.asin == "B0HALAWA01"
+    assert deal.price == 129.0
+
+
+@pytest.mark.asyncio
+async def test_price_bare_preposition_does_not_false_positive_on_ordinary_words():
+    """"ب" followed by a letter (بسعة, بدون) must not be mistaken for a price
+    — only "ب" directly followed by a digit qualifies.
+    """
+    text = "خصم 50% بدون حد اقصى على جميع احذية Anta - Skechers - Umbro"
+    deal = await extract_from_post(text, "LQoffers")
+    assert deal is None

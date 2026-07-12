@@ -114,6 +114,30 @@ async def test_gemini_response_with_markdown_fence_still_parses():
     assert verdict.suggested_target == 4900
 
 
+def test_unmocked_gemini_call_is_blocked():
+    """Proves the tests/conftest.py safety net actually works: any attempt
+    to reach the real Gemini API without an explicit patch.object(...,
+    "_get_client", ...) fails loudly instead of silently spending real
+    quota. This is what guarantees the full suite consumes zero real
+    Gemini requests. (analyze_deal itself catches this — like any other
+    client error — and forwards without a verdict rather than crashing;
+    calling _get_client() directly is what proves the block is in place.)
+    """
+    with pytest.raises(AssertionError, match="real Gemini API"):
+        analyzer_module._get_client()
+
+
+@pytest.mark.asyncio
+async def test_analyze_deal_never_reaches_real_gemini_if_unmocked():
+    """analyze_deal degrades to "unavailable" (returns None) rather than
+    ever completing a real network call when _get_client isn't mocked —
+    the safety net fails closed, not open.
+    """
+    deal = _make_deal()
+    verdict = await analyze_deal(deal, None)
+    assert verdict is None
+
+
 def test_quota_guard_counts_calls():
     import asyncio
 

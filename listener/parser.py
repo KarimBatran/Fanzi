@@ -23,9 +23,19 @@ _URL_RE = re.compile(r"https?://\S+")
 # "السعر: 499 جنيه" / "بسعر 7777" / "Price: 499 EGP" / "499 جنية" — comma
 # thousands, optional decimals. "سعر"/"السعر" both accepted (with/without
 # the definite article), and "جنية" alongside the more common "جنيه" spelling.
+#
+# Third alternative: "ب37428" / "بـ 480" — the preposition "ب" ("for"/"at")
+# directly followed by a number, with no "سعر" and no currency word at all.
+# Extremely common phrasing on Egyptian deal channels ("تلاجة ... ب37428")
+# that the first two alternatives miss entirely, silently dropping otherwise
+# perfectly valid deals at the parse stage. Requires \b before "ب" and a
+# digit shortly after it (through any run of tatweel/elongation characters
+# and at most one space) so it can't match ordinary words starting with "ب"
+# followed by a letter (بسعة, بعد, بدون, ...).
 _PRICE_RE = re.compile(
     r"(?:(?:ال)?سعر|price)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)\s*(?:جنيه|جنية|ج\.م|egp|le)?"
-    r"|([\d,]+(?:\.\d+)?)\s*(?:جنيه|جنية|ج\.م|egp|le)\b",
+    r"|([\d,]+(?:\.\d+)?)\s*(?:جنيه|جنية|ج\.م|egp|le)\b"
+    r"|\bب[ـ]*\s?([\d,]+(?:\.\d+)?)\b",
     re.IGNORECASE,
 )
 
@@ -166,7 +176,7 @@ def _extract_price(text: str) -> float | None:
     match = _PRICE_RE.search(text)
     if not match:
         return None
-    raw = match.group(1) or match.group(2)
+    raw = match.group(1) or match.group(2) or match.group(3)
     try:
         return float(raw.replace(",", ""))
     except ValueError:

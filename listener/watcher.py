@@ -78,9 +78,13 @@ def _format_message(deal: ParsedDeal, verdict_text: str, status_line: str | None
 
 
 async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
+    logger.info("[%s] Post received: %s", channel_name, text[:50].replace("\n", " "))
+
     deal = await extract_from_post(text, channel_name)
     if deal is None:
+        logger.info("[%s] No ASIN found — skipping", channel_name)
         return
+    logger.info("[%s] ASIN extracted: %s", channel_name, deal.asin)
 
     already_tracked = (
         database.get_tracked_product_by_asin(
@@ -93,14 +97,18 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     verdict = await analyze_deal(deal, price_history)
 
     if verdict is None:
+        logger.info("[%s] Groq failed — forwarding without verdict", channel_name)
         # Analysis API failed — forward the raw deal without a verdict rather than dropping it.
         message = _format_message(deal, "unavailable (analysis failed)", None)
         await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
+        logger.info("[%s] Forwarding to admin", channel_name)
         return
 
+    logger.info("[%s] Groq verdict: %s — %s", channel_name, verdict.deal_quality, verdict.reason)
     health.record_deal_analyzed()
 
     if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
+        logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
         return
 
     status_line = None
@@ -114,6 +122,7 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
     verdict_text = f"{emoji} {verdict.reason}"
     message = _format_message(deal, verdict_text, status_line)
+    logger.info("[%s] Forwarding to admin", channel_name)
     await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message)
 
 

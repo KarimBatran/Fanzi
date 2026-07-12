@@ -80,7 +80,11 @@ async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | N
                 break
 
     if asin is None:
-        text_match = _BARE_ASIN_IN_TEXT_RE.search(normalized.upper())
+        # Scan prose only — a URL that already failed extraction/redirect
+        # resolution must not be re-matched here just because its path
+        # segment happens to look ASIN-shaped (e.g. a dead link.amazon code).
+        text_without_urls = _URL_RE.sub(" ", normalized)
+        text_match = _BARE_ASIN_IN_TEXT_RE.search(text_without_urls.upper())
         if text_match:
             asin = text_match.group(0)
 
@@ -115,7 +119,11 @@ async def _extract_asin_from_url(url: str, client: httpx.AsyncClient) -> str | N
 
     if "link.amazon" in host:
         path_segment = urlsplit(url).path.strip("/").split("/")[0] if urlsplit(url).path else ""
-        if _ASIN_RE.match(path_segment):
+        # Real ASINs are always exactly 10 chars. A 9-char code starting with
+        # "B0" is a truncated/opaque short code, not a usable ASIN on its own
+        # — always resolve those via redirect rather than guessing.
+        looks_like_truncated_b0_code = len(path_segment) == 9 and path_segment.upper().startswith("B0")
+        if _ASIN_RE.match(path_segment) and not looks_like_truncated_b0_code:
             return path_segment.upper()
         return await _resolve_via_redirect(url, client)
 

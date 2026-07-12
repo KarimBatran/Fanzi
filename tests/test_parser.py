@@ -58,13 +58,20 @@ async def test_amzn_to_short_link():
 
 
 @pytest.mark.asyncio
-async def test_link_amazon_direct_path():
-    """Post 1 — the link.amazon path segment is used directly, no redirect."""
-    with patch.object(httpx.AsyncClient, "head", new=AsyncMock()) as mock_head:
+async def test_link_amazon_9char_b0_code_follows_redirect():
+    """Post 1 — a 9-char B0-prefixed link.amazon code is a truncated/opaque
+    short code, not a real ASIN on its own (real ASINs are always 10 chars) —
+    it must always be resolved via redirect rather than guessed directly.
+    """
+    with patch.object(
+        httpx.AsyncClient,
+        "head",
+        new=AsyncMock(return_value=_RedirectedResponse("https://www.amazon.eg/dp/B0REALASIN")),
+    ) as mock_head:
         deal = await extract_from_post(POST_1_ADIDAS, "Mego_Reviews")
-        mock_head.assert_not_called()
+        mock_head.assert_called_once()
     assert deal is not None
-    assert deal.asin == "B0E48L1WU"
+    assert deal.asin == "B0REALASIN"
     assert deal.price == 2515.0
 
 

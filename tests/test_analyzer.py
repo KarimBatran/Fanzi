@@ -6,10 +6,12 @@ correctly when none of those pre-checks apply.
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import database
 import listener.analyzer as analyzer_module
 from listener.analyzer import DealVerdict, QuotaGuard, analyze_deal
 from listener.parser import ParsedDeal
@@ -50,29 +52,35 @@ async def test_no_price_skips_gemini():
 
 @pytest.mark.asyncio
 async def test_low_discount_skips_gemini():
+    """Low-discount posts get a synthetic *average* verdict (not "skip") so
+    skipping Gemini doesn't automatically suppress the deal — it flows
+    through the normal MIN_DEAL_QUALITY filter like any other verdict.
+    """
     deal = _make_deal(discount_percent=5)
     fake_client = _fake_client()
     with patch.object(analyzer_module, "_get_client", return_value=fake_client):
         verdict = await analyze_deal(deal, None)
         fake_client.aio.models.generate_content.assert_not_called()
     assert verdict is not None
-    assert verdict.deal_quality == "skip"
+    assert verdict.deal_quality == "average"
 
 
 @pytest.mark.asyncio
 async def test_daily_quota_reached_skips_gemini():
-    guard = analyzer_module._quota_guard
-    original_count, original_date = guard._daily_count, guard._daily_date
-    guard._daily_count = guard.daily_cap
-    try:
-        deal = _make_deal()
-        fake_client = _fake_client()
-        with patch.object(analyzer_module, "_get_client", return_value=fake_client):
-            verdict = await analyze_deal(deal, None)
-            fake_client.aio.models.generate_content.assert_not_called()
-        assert verdict is None
-    finally:
-        guard._daily_count, guard._daily_date = original_count, original_date
+    today = date.today().isoformat()
+    with database.get_connection() as conn:
+        conn.execute(
+            "INSERT INTO gemini_quota (quota_date, call_count) VALUES (?, ?) "
+            "ON CONFLICT(quota_date) DO UPDATE SET call_count = excluded.call_count",
+            (today, analyzer_module._quota_guard.daily_cap),
+        )
+
+    deal = _make_deal()
+    fake_client = _fake_client()
+    with patch.object(analyzer_module, "_get_client", return_value=fake_client):
+        verdict = await analyze_deal(deal, None)
+        fake_client.aio.models.generate_content.assert_not_called()
+    assert verdict is None
 
 
 @pytest.mark.asyncio

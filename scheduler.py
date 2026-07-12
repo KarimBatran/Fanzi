@@ -14,6 +14,7 @@ import database
 import health
 from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import ADMIN_TELEGRAM_ID, CHECK_INTERVAL_MINUTES
+from listener import dedup
 from models.tracked_product import TrackedProduct
 
 _CAIRO_TZ = ZoneInfo("Africa/Cairo")
@@ -58,6 +59,10 @@ async def run_check_cycle(bot: Bot) -> None:
     logger.info("check cycle complete")
     health.record_check_cycle_complete()
     health.write_health_file()
+
+    expired = dedup.cleanup_expired()
+    if expired:
+        logger.info("duplicate-deals cache: purged %d expired record(s)", expired)
 
 
 async def _send_alert(

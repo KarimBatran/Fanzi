@@ -34,6 +34,26 @@ CREATE TABLE IF NOT EXISTS tracked_products (
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- One row per calendar day — the Gemini call count for that day. Keyed by
+-- date so "reset at local midnight" falls out naturally: a new day just
+-- means a new row starting at 0, no explicit reset job needed.
+CREATE TABLE IF NOT EXISTS gemini_quota (
+    quota_date TEXT PRIMARY KEY,
+    call_count INTEGER NOT NULL DEFAULT 0
+);
+
+-- Last-seen state per (channel, product) for duplicate-deal detection.
+-- identifier is "asin:<ASIN>" or "title:<normalized title>" when no ASIN
+-- was available. Re-processing updates price/discount/seen_at in place.
+CREATE TABLE IF NOT EXISTS duplicate_deals (
+    channel_name TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    last_price REAL,
+    last_discount_percent INTEGER,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (channel_name, identifier)
+);
 """
 
 
@@ -175,6 +195,78 @@ def set_product_active(product_id: int, user_id: int, active: bool) -> bool:
             (1 if active else 0, product_id, user_id),
         )
         return cursor.rowcount > 0
+
+
+def get_gemini_quota_count(quota_date: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT call_count FROM gemini_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return row["call_count"] if row else 0
+
+
+def increment_gemini_quota_count(quota_date: str) -> int:
+    """Upserts today's row and returns the new count."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO gemini_quota (quota_date, call_count) VALUES (?, 1)
+            ON CONFLICT(quota_date) DO UPDATE SET call_count = call_count + 1
+            """,
+            (quota_date,),
+        )
+        row = conn.execute(
+            "SELECT call_count FROM gemini_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return row["call_count"]
+
+
+def get_duplicate_record(channel_name: str, identifier: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT last_price, last_discount_percent, last_seen_at
+            FROM duplicate_deals WHERE channel_name = ? AND identifier = ?
+            """,
+            (channel_name, identifier),
+        ).fetchone()
+
+
+def upsert_duplicate_record(
+    channel_name: str,
+    identifier: str,
+    price: float | None,
+    discount_percent: int | None,
+    seen_at: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO duplicate_deals (channel_name, identifier, last_price, last_discount_percent, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(channel_name, identifier) DO UPDATE SET
+                last_price = excluded.last_price,
+                last_discount_percent = excluded.last_discount_percent,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (channel_name, identifier, price, discount_percent, seen_at),
+        )
+
+
+def count_active_duplicate_records(cutoff_iso: str) -> int:
+    """Number of duplicate_deals rows not yet expired (last_seen_at >= cutoff)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM duplicate_deals WHERE last_seen_at >= ?", (cutoff_iso,)
+        ).fetchone()
+        return row["n"]
+
+
+def delete_expired_duplicate_records(cutoff_iso: str) -> int:
+    """Purges rows older than the duplicate window. Returns the count deleted."""
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM duplicate_deals WHERE last_seen_at < ?", (cutoff_iso,))
+        return cursor.rowcount
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

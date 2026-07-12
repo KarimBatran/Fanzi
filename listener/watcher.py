@@ -95,11 +95,16 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         return
     logger.info("[%s] ASIN extracted: %s", channel_name, deal.asin)
 
-    if dedup.is_duplicate(channel_name, deal.asin, deal.title):
+    dedup_outcome = dedup.check(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
+    if dedup_outcome == dedup.DUPLICATE:
         logger.info("[%s] duplicate deal skipped", channel_name)
         health.record_duplicate_skipped()
         return
-    dedup.mark_seen(channel_name, deal.asin, deal.title)
+    if dedup_outcome == dedup.PRICE_CHANGED:
+        logger.info("[%s] price changed — reprocessing", channel_name)
+    elif dedup_outcome == dedup.WINDOW_EXPIRED:
+        logger.info("[%s] duplicate window expired — reprocessing", channel_name)
+    dedup.mark_seen(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
 
     already_tracked = (
         database.get_tracked_product_by_asin(

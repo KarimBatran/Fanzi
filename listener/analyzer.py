@@ -17,6 +17,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
+import database
 from config import (
     DAILY_ANALYSIS_CAP,
     GEMINI_API_KEY,
@@ -65,37 +66,36 @@ class QuotaGuard:
     entirely once it's True (this class does not enforce the cap inside
     `acquire()`, so a checked-then-acquire race can't spin forever waiting
     for a slot that will never come).
+
+    The per-minute count is in-memory only (a 60s window losing its history
+    on restart is harmless). The daily count is persisted in the
+    gemini_quota table, keyed by date, so restarts don't reset it and it
+    naturally resets at local midnight (a new day is just a fresh row).
     """
 
     def __init__(self, rate_limit_per_min: int, daily_cap: int) -> None:
         self.rate_limit_per_min = rate_limit_per_min
         self.daily_cap = daily_cap
         self._call_times: list[float] = []
-        self._daily_count = 0
-        self._daily_date = date.today()
         self._lock = asyncio.Lock()
 
-    def _reset_if_new_day(self) -> None:
-        today = date.today()
-        if today != self._daily_date:
-            self._daily_date = today
-            self._daily_count = 0
+    @staticmethod
+    def _today() -> str:
+        return date.today().isoformat()
 
     def daily_count(self) -> int:
-        self._reset_if_new_day()
-        return self._daily_count
+        return database.get_gemini_quota_count(self._today())
 
     def minute_count(self) -> int:
         cutoff = time.monotonic() - 60
         return sum(1 for t in self._call_times if t > cutoff)
 
     def daily_quota_reached(self) -> bool:
-        self._reset_if_new_day()
-        return self._daily_count >= self.daily_cap
+        return self.daily_count() >= self.daily_cap
 
     async def acquire(self) -> None:
         """Waits until a call slot is available under the per-minute rate
-        limit, then reserves it and increments the daily counter.
+        limit, then reserves it and increments the persisted daily counter.
         """
         async with self._lock:
             while True:
@@ -107,8 +107,7 @@ class QuotaGuard:
                 await asyncio.sleep(max(wait_seconds, 0.05))
 
             self._call_times.append(time.monotonic())
-            self._reset_if_new_day()
-            self._daily_count += 1
+            database.increment_gemini_quota_count(self._today())
 
 
 _quota_guard = QuotaGuard(RATE_LIMIT_PER_MIN, DAILY_ANALYSIS_CAP)
@@ -127,10 +126,12 @@ def _get_client() -> genai.Client:
 
 
 def get_quota_status() -> dict:
-    """Snapshot for /status — {daily_count, daily_cap, minute_count}."""
+    """Snapshot for /status — {daily_count, daily_cap, remaining, minute_count}."""
+    daily_count = _quota_guard.daily_count()
     return {
-        "daily_count": _quota_guard.daily_count(),
+        "daily_count": daily_count,
         "daily_cap": _quota_guard.daily_cap,
+        "remaining": max(0, _quota_guard.daily_cap - daily_count),
         "minute_count": _quota_guard.minute_count(),
     }
 
@@ -143,9 +144,11 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
     """Returns a DealVerdict, or None if analysis couldn't be completed (API
     failure, timeout, or daily quota exhausted) — callers fall back to
     forwarding the raw deal with an "unavailable" verdict rather than
-    dropping it. A low-discount post gets a synthetic "skip" verdict instead
-    of None, since that's a deliberate skip, not a failure — it flows through
-    the same MIN_DEAL_QUALITY filter as a real "skip" verdict would.
+    dropping it. A low-discount post gets a synthetic "average" verdict
+    instead — a neutral, non-biased quality assessment (not a hard-coded
+    "skip") that goes through the exact same MIN_DEAL_QUALITY filter as a
+    real Gemini verdict would, so skipping Gemini never *automatically*
+    suppresses the deal on its own.
     """
     if deal.price is None or deal.price <= 0:
         logger.info("skipped analysis (no price)")
@@ -154,9 +157,9 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
     if deal.discount_percent is not None and deal.discount_percent < MIN_DISCOUNT_FOR_ANALYSIS:
         logger.info("skipped analysis (low discount)")
         return DealVerdict(
-            deal_quality="skip",
-            reason=f"Discount ({deal.discount_percent}%) is below the {MIN_DISCOUNT_FOR_ANALYSIS}% analysis threshold.",
-            suggested_target=int(deal.price),
+            deal_quality="average",
+            reason=f"Discount ({deal.discount_percent}%) is below the {MIN_DISCOUNT_FOR_ANALYSIS}% analysis threshold — not sent to Gemini.",
+            suggested_target=int(deal.price * 0.95),
             category="other",
         )
 

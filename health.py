@@ -14,6 +14,7 @@ from datetime import date, datetime
 import database
 from config import CHECK_INTERVAL_MINUTES
 from listener import analyzer as deal_analyzer
+from listener import dedup
 
 HEALTH_FILE_PATH = "health.json"
 
@@ -102,8 +103,10 @@ def build_snapshot() -> dict:
         "deals_today": _deals_analyzed_today,
         "alerts_today": _alerts_sent_today,
         "duplicates_skipped_today": _duplicates_skipped_today,
+        "active_duplicate_entries": dedup.get_active_count(),
         "gemini_calls_today": quota["daily_count"],
         "gemini_daily_cap": quota["daily_cap"],
+        "gemini_remaining": quota["remaining"],
         "gemini_calls_this_minute": quota["minute_count"],
         "pid": os.getpid(),
     }
@@ -145,9 +148,11 @@ def format_status_message() -> str:
         f"📡 Channels: {snapshot['channels_active']}/{snapshot['channels_configured']} listening",
         f"🤖 Deals analyzed today: {snapshot['deals_today']}",
         f"💸 Alerts sent today: {snapshot['alerts_today']}",
-        f"🧠 Gemini calls today: {snapshot['gemini_calls_today']}/{snapshot['gemini_daily_cap']}",
-        f"   ({snapshot['gemini_calls_this_minute']} in the last minute, "
-        f"{snapshot['duplicates_skipped_today']} duplicates skipped today)",
+        f"🧠 Gemini calls today: {snapshot['gemini_calls_today']}/{snapshot['gemini_daily_cap']} "
+        f"({snapshot['gemini_remaining']} remaining)",
+        f"   {snapshot['gemini_calls_this_minute']} in the last minute",
+        f"   {snapshot['duplicates_skipped_today']} duplicates skipped today, "
+        f"{snapshot['active_duplicate_entries']} active duplicate entries",
     ]
     if delayed:
         lines.append("")

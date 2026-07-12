@@ -99,11 +99,37 @@ def get_active_products(user_id: int) -> list[TrackedProduct]:
         return [_row_to_product(row) for row in rows]
 
 
-def get_all_active_products() -> list[TrackedProduct]:
-    """Every active product across all users — used by the scheduler (Milestone 3)."""
+def get_all_active_products_with_owner() -> list[tuple[TrackedProduct, int]]:
+    """Every active product across all users, paired with the owning user's
+    telegram_id — used by the scheduler to know who to alert.
+    """
     with get_connection() as conn:
-        rows = conn.execute("SELECT * FROM tracked_products WHERE active = 1 ORDER BY id").fetchall()
-        return [_row_to_product(row) for row in rows]
+        rows = conn.execute(
+            """
+            SELECT tp.*, u.telegram_id AS owner_telegram_id
+            FROM tracked_products tp
+            JOIN users u ON u.id = tp.user_id
+            WHERE tp.active = 1
+            ORDER BY tp.id
+            """
+        ).fetchall()
+        return [(_row_to_product(row), row["owner_telegram_id"]) for row in rows]
+
+
+def update_price_check(product_id: int, current_price: float) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tracked_products SET current_price = ?, last_checked = datetime('now') WHERE id = ?",
+            (current_price, product_id),
+        )
+
+
+def mark_notified(product_id: int, price: float) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tracked_products SET last_notified_price = ? WHERE id = ?",
+            (price, product_id),
+        )
 
 
 def remove_product(product_id: int, user_id: int) -> bool:

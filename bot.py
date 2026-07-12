@@ -23,9 +23,10 @@ from telegram.ext import (
 )
 
 import database
+import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
-from config import TELEGRAM_BOT_TOKEN
+from config import ADMIN_TELEGRAM_ID, TELEGRAM_BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs full request URLs at INFO, which embeds the bot token
@@ -159,8 +160,41 @@ async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"No tracked product #{product_id} found for you.")
 
 
+async def checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually triggers one scheduler check cycle. Restricted to
+    ADMIN_TELEGRAM_ID so it can't be abused if the bot is ever shared.
+    """
+    if ADMIN_TELEGRAM_ID == 0 or update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    await update.message.reply_text("Running a check cycle now...")
+    await scheduler_module.run_check_cycle(context.bot)
+    await update.message.reply_text("Check cycle complete.")
+
+
+async def _post_init(application: Application) -> None:
+    sched = scheduler_module.build_scheduler(application.bot)
+    sched.start()
+    application.bot_data["scheduler"] = sched
+    logger.info("scheduler started (interval-based background job)")
+
+
+async def _post_shutdown(application: Application) -> None:
+    sched = application.bot_data.get("scheduler")
+    if sched is not None:
+        sched.shutdown(wait=False)
+        logger.info("scheduler stopped")
+
+
 def build_application() -> Application:
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     track_conversation = ConversationHandler(
         entry_points=[CommandHandler("track", track_start)],
@@ -175,6 +209,7 @@ def build_application() -> Application:
     application.add_handler(track_conversation)
     application.add_handler(CommandHandler("mytracks", mytracks))
     application.add_handler(CommandHandler("remove", remove))
+    application.add_handler(CommandHandler("checkall", checkall))
 
     return application
 

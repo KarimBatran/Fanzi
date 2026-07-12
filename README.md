@@ -24,3 +24,6 @@ python bot.py
 - Milestone 2: real Playwright price/title fetching (persistent browser profile in
   `playwright_profile/`, retry+backoff, specific fetch-failure exceptions), wired into `/track`
   and `/mytracks`.
+- Milestone 3: APScheduler background job (`CHECK_INTERVAL_MINUTES`, default 60) that checks all
+  active products, updates prices, and sends dedup'd price-drop alerts. `/checkall` (restricted to
+  `ADMIN_TELEGRAM_ID`) triggers a cycle manually for testing.

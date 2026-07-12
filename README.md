@@ -13,6 +13,7 @@ this into a paid product without switching to a compliant data source
 
 ```
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 copy .env.example .env   # then fill in TELEGRAM_BOT_TOKEN from @BotFather
 python bot.py
 ```
@@ -20,3 +21,6 @@ python bot.py
 ## Status
 
 - Milestone 1: scaffold, database, `/start`, `/track` (price fetch mocked), `/mytracks`, `/remove`.
+- Milestone 2: real Playwright price/title fetching (persistent browser profile in
+  `playwright_profile/`, retry+backoff, specific fetch-failure exceptions), wired into `/track`
+  and `/mytracks`.

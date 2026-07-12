@@ -24,9 +24,14 @@ from telegram.ext import (
 
 import database
 from amazon.parser import extract_asin, normalize_product_url
+from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import TELEGRAM_BOT_TOKEN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# httpx logs full request URLs at INFO, which embeds the bot token
+# (https://api.telegram.org/bot<TOKEN>/...) — keep it at WARNING so the
+# token never lands in a log file.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("fanzi.bot")
 
 WAITING_URL, WAITING_TARGET = range(2)
@@ -60,17 +65,27 @@ async def track_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return WAITING_URL
 
-    context.user_data["asin"] = asin
-    context.user_data["url"] = normalize_product_url(asin)
-
+    url = normalize_product_url(asin)
     await update.message.reply_text("Got it — fetching current price...")
 
-    # Milestone 2 wires in real Playwright price fetching. For now this is a
-    # placeholder so the rest of the /track flow can be built and tested.
-    context.user_data["title"] = None
-    context.user_data["current_price"] = None
+    try:
+        title, price = await fetch_product(url)
+    except ProductFetchError as exc:
+        logger.warning("product fetch failed for %s: %s", asin, exc)
+        await update.message.reply_text(
+            "Couldn't fetch that product right now — try again in a bit."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
 
-    await update.message.reply_text("What price should I notify you at (EGP)?")
+    context.user_data["asin"] = asin
+    context.user_data["url"] = url
+    context.user_data["title"] = title
+    context.user_data["current_price"] = price
+
+    await update.message.reply_text(
+        f"Current price: {format_price(price)} EGP — notify below what price?"
+    )
     return WAITING_TARGET
 
 
@@ -117,9 +132,10 @@ async def mytracks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = []
     for p in products:
         title = p.title or "(title not fetched yet)"
-        price = f"{p.current_price:g} {p.currency}" if p.current_price is not None else "not fetched yet"
+        price = f"{format_price(p.current_price)} {p.currency}" if p.current_price is not None else "not fetched yet"
         lines.append(
-            f"#{p.id} — {p.asin}\n{title}\nCurrent: {price} | Target: {p.target_price:g} {p.currency}"
+            f"#{p.id} — {p.asin}\n{title}\n"
+            f"Current: {price} | Target: {format_price(p.target_price)} {p.currency}"
         )
 
     await update.message.reply_text("\n\n".join(lines))

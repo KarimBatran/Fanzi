@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -148,7 +148,18 @@ async def _resolve_via_redirect(url: str, client: httpx.AsyncClient) -> str | No
         logger.warning("redirect for %s did not resolve to an Amazon URL: %s", url, resolved_url)
         return None
 
-    return await extract_asin(resolved_url, client)
+    asin = await extract_asin(resolved_url, client)
+    if asin:
+        return asin
+
+    # Some Amazon promo/redirect pages (e.g. /promotion/psp/...) don't carry
+    # the ASIN in the path at all — it's in a `redirectAsin` query param instead.
+    query_params = parse_qs(urlsplit(resolved_url).query)
+    redirect_asin_values = query_params.get("redirectAsin")
+    if redirect_asin_values and _ASIN_RE.match(redirect_asin_values[0]):
+        return redirect_asin_values[0].upper()
+
+    return None
 
 
 def _extract_price(text: str) -> float | None:

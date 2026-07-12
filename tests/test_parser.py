@@ -91,6 +91,27 @@ async def test_link_amazon_needs_redirect():
 
 
 @pytest.mark.asyncio
+async def test_link_amazon_redirect_asin_in_query_param():
+    """Some Amazon promo/redirect pages (e.g. /promotion/psp/...) carry the
+    real ASIN in a `redirectAsin` query param instead of the URL path.
+    """
+    with patch.object(
+        httpx.AsyncClient,
+        "get",
+        new=AsyncMock(
+            return_value=_RedirectedResponse(
+                "https://www.amazon.eg/promotion/psp/PROMO123?redirectAsin=B07RJNSTZ&tag=egypt06-21"
+            )
+        ),
+    ):
+        text = "السعر: 250 جنيه\nhttps://link.amazon/re-direct?x=1"
+        deal = await extract_from_post(text, "test_channel")
+    assert deal is not None
+    assert deal.asin == "B07RJNSTZ"
+    assert deal.price == 250.0
+
+
+@pytest.mark.asyncio
 async def test_generic_shortener_tinyurl():
     """Post 2 — a tinyurl.com link resolved via a mocked GET redirect."""
     with patch.object(

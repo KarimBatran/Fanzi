@@ -170,3 +170,32 @@ async def test_price_bare_preposition_does_not_false_positive_on_ordinary_words(
     text = "خصم 50% بدون حد اقصى على جميع احذية Anta - Skechers - Umbro"
     deal = await extract_from_post(text, "LQoffers")
     assert deal is None
+
+
+@pytest.mark.parametrize(
+    "price_text",
+    ["19,999", "1,299", "2,190", "20,999"],
+)
+@pytest.mark.asyncio
+async def test_price_english_thousands_separator(price_text: str):
+    """English (ASCII ",") thousands separator, various magnitudes."""
+    text = f"ماكينة تحضير قهوة جران لاتيسيما بسعر {price_text}ج\nhttps://www.amazon.eg/dp/B0COFFEE01"
+    deal = await extract_from_post(text, "test_channel")
+    assert deal is not None
+    assert deal.price == float(price_text.replace(",", ""))
+
+
+@pytest.mark.parametrize(
+    "price_text",
+    ["19،999", "1،299", "2،190", "20،999"],
+)
+@pytest.mark.asyncio
+async def test_price_arabic_thousands_separator(price_text: str):
+    """Arabic thousands separator "،" (U+060C) must parse identically to the
+    ASCII comma — previously the untranslated "،" truncated the digit run,
+    e.g. "19،999" parsed as just 19 instead of 19999 (real reported bug).
+    """
+    text = f"ماكينة تحضير قهوة جران لاتيسيما بسعر {price_text}ج\nhttps://www.amazon.eg/dp/B0COFFEE01"
+    deal = await extract_from_post(text, "test_channel")
+    assert deal is not None
+    assert deal.price == float(price_text.replace("،", ""))

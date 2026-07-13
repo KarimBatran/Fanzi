@@ -42,7 +42,11 @@ _PRICE_RE = re.compile(
 # "-7%", "(٧٪ خصم)", "خصم 7%", "7% off"
 _DISCOUNT_RE = re.compile(r"[-(]?\s*(\d{1,2})\s*%")
 
-_ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+# Also folds the Arabic thousands separator "،" (U+060C) to the ASCII comma
+# the price regex's [\d,] character class expects — without this, a price
+# like "19،999" (Arabic-formatted thousands) parses as just "19", silently
+# dropping the rest of the number once the regex hits the untranslated "،".
+_ARABIC_INDIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩،", "0123456789,")
 
 _EMOJI_PREFIX_RE = re.compile(r"^[\W_]+", re.UNICODE)
 

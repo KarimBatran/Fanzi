@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS gemini_quota (
     external_quota_exhausted INTEGER NOT NULL DEFAULT 0
 );
 
+-- Same shape as gemini_quota, for the Groq fallback provider
+-- (listener/ai_providers.py) — kept as a separate table rather than a
+-- generic provider-keyed one so each provider's existing call pattern
+-- (get/increment/mark/reset) stays a simple one-to-one mirror.
+CREATE TABLE IF NOT EXISTS groq_quota (
+    quota_date TEXT PRIMARY KEY,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    external_quota_exhausted INTEGER NOT NULL DEFAULT 0
+);
+
 -- Last-seen state per (channel, product) for duplicate-deal detection.
 -- identifier is "asin:<ASIN>" or "title:<normalized title>" when no ASIN
 -- was available. Re-processing updates price/discount/seen_at in place.
@@ -275,6 +285,57 @@ def reset_gemini_external_quota(quota_date: str) -> None:
     with get_connection() as conn:
         conn.execute(
             "UPDATE gemini_quota SET external_quota_exhausted = 0 WHERE quota_date = ?",
+            (quota_date,),
+        )
+
+
+def get_groq_quota_count(quota_date: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT call_count FROM groq_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return row["call_count"] if row else 0
+
+
+def increment_groq_quota_count(quota_date: str) -> int:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO groq_quota (quota_date, call_count) VALUES (?, 1)
+            ON CONFLICT(quota_date) DO UPDATE SET call_count = call_count + 1
+            """,
+            (quota_date,),
+        )
+        row = conn.execute(
+            "SELECT call_count FROM groq_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return row["call_count"]
+
+
+def get_groq_external_quota_exhausted(quota_date: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT external_quota_exhausted FROM groq_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return bool(row["external_quota_exhausted"]) if row else False
+
+
+def mark_groq_external_quota_exhausted(quota_date: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO groq_quota (quota_date, call_count, external_quota_exhausted)
+            VALUES (?, 0, 1)
+            ON CONFLICT(quota_date) DO UPDATE SET external_quota_exhausted = 1
+            """,
+            (quota_date,),
+        )
+
+
+def reset_groq_external_quota(quota_date: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE groq_quota SET external_quota_exhausted = 0 WHERE quota_date = ?",
             (quota_date,),
         )
 

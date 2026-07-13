@@ -44,7 +44,8 @@ from config import (
     TELETHON_SESSION_NAME,
 )
 from listener import channels_store, dedup, pending_deals
-from listener.analyzer import analyze_deal, get_quota_status, meets_min_quality
+from listener.ai_providers import get_manager
+from listener.analyzer import analyze_deal, meets_min_quality
 from listener.parser import ParsedDeal, extract_from_post
 
 logger = logging.getLogger("fanzi.listener.watcher")
@@ -115,15 +116,14 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     verdict = await analyze_deal(deal, price_history)
 
     if verdict is None:
-        logger.info("[%s] Gemini unavailable — forwarding without verdict", channel_name)
-        # Analysis skipped/failed for one of several reasons — forward the raw
-        # deal without a verdict rather than dropping it, but distinguish
-        # "Google's daily quota is used up" (expected, not an app bug) from an
-        # actual API/parser failure so the admin isn't misled into thinking
-        # something is broken every time the free-tier quota runs out.
-        quota = get_quota_status()
-        if quota["external_quota_exhausted"] or quota["remaining"] <= 0:
-            verdict_text = "unavailable (daily Gemini quota reached)"
+        logger.info("[%s] AI providers unavailable — forwarding without verdict", channel_name)
+        # Both providers failed/skipped for one of several reasons — forward
+        # the raw deal without a verdict rather than dropping it, but
+        # distinguish "both providers' daily quota is used up" (expected, not
+        # an app bug) from an actual API/parser failure so the admin isn't
+        # misled into thinking something is broken every time quota runs out.
+        if get_manager().both_quota_exhausted():
+            verdict_text = "unavailable (daily AI quota reached on both providers)"
         else:
             verdict_text = "unavailable (analysis failed)"
         message = _format_message(deal, verdict_text, clean_url)
@@ -131,7 +131,9 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         logger.info("[%s] Forwarding to admin", channel_name)
         return
 
-    logger.info("[%s] Gemini verdict: %s — %s", channel_name, verdict.deal_quality, verdict.reason)
+    logger.info(
+        "[%s] AI verdict (%s): %s — %s", channel_name, verdict.provider, verdict.deal_quality, verdict.reason
+    )
     health.record_deal_analyzed()
 
     if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):

@@ -23,17 +23,23 @@ TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "")
 TELETHON_SESSION_NAME = os.getenv("TELETHON_SESSION_NAME", "fanzi_listener")
 DEAL_CHANNELS = [c.strip() for c in os.getenv("DEAL_CHANNELS", "").split(",") if c.strip()]
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# From https://console.groq.com/keys (free tier) — automatic fallback when
+# Gemini is unavailable/quota-exhausted. Left empty, Groq requests fail fast
+# with a FatalProviderError (no key configured) rather than crashing.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 MIN_DEAL_QUALITY = os.getenv("MIN_DEAL_QUALITY", "good")
 
-# Gemini quota management (listener/analyzer.py) — keeps the app comfortably
-# within the Gemini free tier.
+# Gemini-specific quota management (listener/ai_providers.py) — keeps the app
+# comfortably within the Gemini free tier.
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "12"))
 DAILY_ANALYSIS_CAP = int(os.getenv("DAILY_ANALYSIS_CAP", "1400"))
 MIN_DISCOUNT_FOR_ANALYSIS = int(os.getenv("MIN_DISCOUNT_FOR_ANALYSIS", "10"))
 DUPLICATE_WINDOW_HOURS = int(os.getenv("DUPLICATE_WINDOW_HOURS", "24"))
 
-# Retry behavior for transient Gemini failures (UNAVAILABLE) — not Google's
-# actual quota values, which the app must never assume or hardcode.
-GEMINI_RETRY_COUNT = int(os.getenv("GEMINI_RETRY_COUNT", "3"))
-GEMINI_RETRY_INITIAL_BACKOFF_SECONDS = float(os.getenv("GEMINI_RETRY_INITIAL_BACKOFF_SECONDS", "1"))
-GEMINI_RETRY_MAX_BACKOFF_SECONDS = float(os.getenv("GEMINI_RETRY_MAX_BACKOFF_SECONDS", "4"))
+# Retry/circuit-breaker policy shared by both AI providers
+# (listener/ai_providers.py) — mechanics only, never provider quota values.
+AI_RETRY_COUNT = int(os.getenv("AI_RETRY_COUNT", "3"))
+AI_RETRY_INITIAL_BACKOFF_SECONDS = float(os.getenv("AI_RETRY_INITIAL_BACKOFF_SECONDS", "1"))
+AI_RETRY_MAX_BACKOFF_SECONDS = float(os.getenv("AI_RETRY_MAX_BACKOFF_SECONDS", "4"))
+AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
+AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("AI_CIRCUIT_BREAKER_COOLDOWN_MINUTES", "15")) * 60

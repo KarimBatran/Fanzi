@@ -13,8 +13,8 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
-from listener import analyzer as deal_analyzer
 from listener import dedup
+from listener.ai_providers import get_manager
 
 HEALTH_FILE_PATH = "health.json"
 
@@ -91,7 +91,7 @@ def build_snapshot() -> dict:
     last_check_seconds_ago = (
         int((datetime.now() - _last_check).total_seconds()) if _last_check is not None else None
     )
-    quota = deal_analyzer.get_quota_status()
+    providers = get_manager().status_snapshot()
     return {
         "status": "delayed" if _is_delayed() else "ok",
         "uptime_seconds": _uptime_seconds(),
@@ -104,11 +104,7 @@ def build_snapshot() -> dict:
         "alerts_today": _alerts_sent_today,
         "duplicates_skipped_today": _duplicates_skipped_today,
         "active_duplicate_entries": dedup.get_active_count(),
-        "gemini_calls_today": quota["daily_count"],
-        "gemini_daily_cap": quota["daily_cap"],
-        "gemini_remaining": quota["remaining"],
-        "gemini_calls_this_minute": quota["minute_count"],
-        "gemini_external_quota_exhausted": quota["external_quota_exhausted"],
+        "providers": providers,
         "pid": os.getpid(),
     }
 
@@ -140,6 +136,11 @@ def format_status_message() -> str:
     else:
         last_check_line = "🔍 Last price check: not yet run"
 
+    providers = snapshot["providers"]
+
+    def _latency_line(p: dict) -> str:
+        return f"Last latency: {int(p['last_latency_ms'])} ms" if p["last_latency_ms"] is not None else "Last latency: n/a"
+
     lines = [
         header,
         "",
@@ -149,12 +150,20 @@ def format_status_message() -> str:
         f"📡 Channels: {snapshot['channels_active']}/{snapshot['channels_configured']} listening",
         f"🤖 Deals analyzed today: {snapshot['deals_today']}",
         f"💸 Alerts sent today: {snapshot['alerts_today']}",
-        f"🧠 Gemini calls today: {snapshot['gemini_calls_today']}",
-        f"📊 Internal limit: {snapshot['gemini_daily_cap']} ({snapshot['gemini_remaining']} remaining)",
-        f"   {snapshot['gemini_calls_this_minute']} in the last minute",
-        f"☁️ External quota: {'EXHAUSTED' if snapshot['gemini_external_quota_exhausted'] else 'AVAILABLE'}",
         f"   {snapshot['duplicates_skipped_today']} duplicates skipped today, "
         f"{snapshot['active_duplicate_entries']} active duplicate entries",
+        "",
+        "🧠 AI Providers",
+        "Gemini",
+        f"Status: {providers['gemini']['status']}",
+        f"Calls today: {providers['gemini']['calls_today']}",
+        _latency_line(providers["gemini"]),
+        "Groq",
+        f"Status: {providers['groq']['status']}",
+        f"Calls today: {providers['groq']['calls_today']}",
+        _latency_line(providers["groq"]),
+        f"Current primary: {providers['primary']}",
+        f"Fallback: {providers['fallback']}",
     ]
     if delayed:
         lines.append("")

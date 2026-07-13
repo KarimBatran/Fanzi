@@ -91,6 +91,76 @@ CREATE TABLE IF NOT EXISTS duplicate_deals (
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY (channel_name, identifier)
 );
+
+-- Every successful (real Gemini/Groq) verdict — the raw training data for
+-- listener/learning.py. Never written for unavailable/skipped/fallback
+-- verdicts or parser failures (see listener/analyzer.py).
+CREATE TABLE IF NOT EXISTS verdicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asin TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    brand TEXT,
+    category TEXT NOT NULL,
+    title TEXT,
+    current_price REAL NOT NULL,
+    discount_percent INTEGER,
+    deal_quality TEXT NOT NULL,
+    reason TEXT,
+    suggested_target INTEGER,
+    channel TEXT,
+    timestamp TEXT NOT NULL
+);
+
+-- Aggregated knowledge derived from verdict history (listener/learning.py).
+-- key is rule-type-specific: brand name, "brand|category", "category|price_bucket",
+-- or "category|discount_bucket". confidence/predicted_quality/sample_count
+-- are recomputed incrementally on every new verdict (see rule_votes below),
+-- never by rescanning all of `verdicts` (except an explicit /rebuildrules).
+CREATE TABLE IF NOT EXISTS learned_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_type TEXT NOT NULL,
+    key TEXT NOT NULL,
+    predicted_quality TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    last_validated TEXT,
+    last_updated TEXT NOT NULL,
+    rule_version INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (rule_type, key)
+);
+
+-- Internal support table (not part of the learned_rules columns the spec
+-- lists, but required to recompute confidence/predicted_quality
+-- incrementally with recency decay applied, without rescanning history).
+-- One row per (rule_type, key, quality) holding that quality's
+-- decay-weighted vote total.
+CREATE TABLE IF NOT EXISTS rule_votes (
+    rule_type TEXT NOT NULL,
+    key TEXT NOT NULL,
+    quality TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (rule_type, key, quality)
+);
+
+-- Per-day learning-engine analytics (listener/learning.py) — survives
+-- restarts like provider_stats.
+CREATE TABLE IF NOT EXISTS learning_stats (
+    stat_date TEXT PRIMARY KEY,
+    ai_calls_saved INTEGER NOT NULL DEFAULT 0,
+    rule_hits INTEGER NOT NULL DEFAULT 0,
+    rule_misses INTEGER NOT NULL DEFAULT 0,
+    validation_calls INTEGER NOT NULL DEFAULT 0,
+    validation_agreements INTEGER NOT NULL DEFAULT 0,
+    validation_disagreements INTEGER NOT NULL DEFAULT 0
+);
+
+-- Tiny key/value store — currently just the knowledge-base version counter,
+-- bumped on /resetrules and /rebuildrules so /status can show it.
+CREATE TABLE IF NOT EXISTS learning_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -481,6 +551,233 @@ def delete_expired_duplicate_records(cutoff_iso: str) -> int:
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM duplicate_deals WHERE last_seen_at < ?", (cutoff_iso,))
         return cursor.rowcount
+
+
+# --- Self-improving knowledge engine (listener/learning.py) --------------
+
+
+def insert_verdict(
+    asin: str,
+    provider: str,
+    brand: str | None,
+    category: str,
+    title: str | None,
+    current_price: float,
+    discount_percent: int | None,
+    deal_quality: str,
+    reason: str | None,
+    suggested_target: int | None,
+    channel: str | None,
+    timestamp: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO verdicts (
+                asin, provider, brand, category, title, current_price,
+                discount_percent, deal_quality, reason, suggested_target,
+                channel, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asin, provider, brand, category, title, current_price,
+                discount_percent, deal_quality, reason, suggested_target,
+                channel, timestamp,
+            ),
+        )
+
+
+def get_all_verdicts_chronological() -> list[sqlite3.Row]:
+    """Used only by /rebuildrules to replay history from scratch."""
+    with get_connection() as conn:
+        return conn.execute("SELECT * FROM verdicts ORDER BY timestamp ASC, id ASC").fetchall()
+
+
+def category_seen_before(category: str) -> bool:
+    """Whether any verdict has ever been recorded for this category —
+    listener.learning uses this to treat a genuinely new category as an
+    outlier (always call AI) rather than guessing from zero history.
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT 1 FROM verdicts WHERE category = ? LIMIT 1", (category,)).fetchone()
+        return row is not None
+
+
+def get_learned_rule(rule_type: str, key: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM learned_rules WHERE rule_type = ? AND key = ?", (rule_type, key)
+        ).fetchone()
+
+
+def upsert_learned_rule(
+    rule_type: str,
+    key: str,
+    predicted_quality: str,
+    confidence: float,
+    sample_count: int,
+    last_updated: str,
+    last_validated: str | None,
+    enabled: bool,
+    rule_version: int,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO learned_rules (
+                rule_type, key, predicted_quality, confidence, sample_count,
+                last_validated, last_updated, rule_version, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(rule_type, key) DO UPDATE SET
+                predicted_quality = excluded.predicted_quality,
+                confidence = excluded.confidence,
+                sample_count = excluded.sample_count,
+                last_validated = excluded.last_validated,
+                last_updated = excluded.last_updated,
+                rule_version = excluded.rule_version,
+                enabled = excluded.enabled
+            """,
+            (
+                rule_type, key, predicted_quality, confidence, sample_count,
+                last_validated, last_updated, rule_version, 1 if enabled else 0,
+            ),
+        )
+
+
+def set_rule_last_validated(rule_type: str, key: str, last_validated: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE learned_rules SET last_validated = ? WHERE rule_type = ? AND key = ?",
+            (last_validated, rule_type, key),
+        )
+
+
+def get_rule_votes(rule_type: str, key: str) -> dict[str, float]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT quality, weight FROM rule_votes WHERE rule_type = ? AND key = ?", (rule_type, key)
+        ).fetchall()
+    return {row["quality"]: row["weight"] for row in rows}
+
+
+def set_rule_votes(rule_type: str, key: str, votes: dict[str, float]) -> None:
+    with get_connection() as conn:
+        for quality, weight in votes.items():
+            conn.execute(
+                """
+                INSERT INTO rule_votes (rule_type, key, quality, weight) VALUES (?, ?, ?, ?)
+                ON CONFLICT(rule_type, key, quality) DO UPDATE SET weight = excluded.weight
+                """,
+                (rule_type, key, quality, weight),
+            )
+
+
+def list_learned_rules(enabled_only: bool = False) -> list[sqlite3.Row]:
+    query = "SELECT * FROM learned_rules"
+    if enabled_only:
+        query += " WHERE enabled = 1"
+    query += " ORDER BY confidence DESC, sample_count DESC"
+    with get_connection() as conn:
+        return conn.execute(query).fetchall()
+
+
+def count_rules_by_type() -> dict[str, int]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT rule_type, COUNT(*) AS n FROM learned_rules WHERE enabled = 1 GROUP BY rule_type"
+        ).fetchall()
+    return {row["rule_type"]: row["n"] for row in rows}
+
+
+def clear_learned_rules() -> None:
+    """Used by /resetrules and /rebuildrules — leaves verdict history intact."""
+    with get_connection() as conn:
+        conn.execute("DELETE FROM learned_rules")
+        conn.execute("DELETE FROM rule_votes")
+
+
+def get_kb_version() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT value FROM learning_meta WHERE key = 'kb_version'").fetchone()
+    return int(row["value"]) if row else 1
+
+
+def bump_kb_version() -> int:
+    new_version = get_kb_version() + 1
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO learning_meta (key, value) VALUES ('kb_version', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(new_version),),
+        )
+    return new_version
+
+
+def _bump_learning_stat(stat_date: str, column: str, delta: int = 1) -> None:
+    assert column in (
+        "ai_calls_saved",
+        "rule_hits",
+        "rule_misses",
+        "validation_calls",
+        "validation_agreements",
+        "validation_disagreements",
+    )
+    with get_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO learning_stats (stat_date, {column}) VALUES (?, ?)
+            ON CONFLICT(stat_date) DO UPDATE SET {column} = {column} + excluded.{column}
+            """,
+            (stat_date, delta),
+        )
+
+
+def record_ai_call_saved(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "ai_calls_saved")
+
+
+def record_rule_hit(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "rule_hits")
+
+
+def record_rule_miss(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "rule_misses")
+
+
+def record_validation_call(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "validation_calls")
+
+
+def record_validation_agreement(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "validation_agreements")
+
+
+def record_validation_disagreement(stat_date: str) -> None:
+    _bump_learning_stat(stat_date, "validation_disagreements")
+
+
+def get_learning_stats(stat_date: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM learning_stats WHERE stat_date = ?", (stat_date,)).fetchone()
+    if row is None:
+        return {
+            "ai_calls_saved": 0,
+            "rule_hits": 0,
+            "rule_misses": 0,
+            "validation_calls": 0,
+            "validation_agreements": 0,
+            "validation_disagreements": 0,
+        }
+    return {
+        "ai_calls_saved": row["ai_calls_saved"],
+        "rule_hits": row["rule_hits"],
+        "rule_misses": row["rule_misses"],
+        "validation_calls": row["validation_calls"],
+        "validation_agreements": row["validation_agreements"],
+        "validation_disagreements": row["validation_disagreements"],
+    }
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

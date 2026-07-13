@@ -13,7 +13,7 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
-from listener import dedup
+from listener import dedup, learning
 from listener.ai_providers import get_manager
 
 HEALTH_FILE_PATH = "health.json"
@@ -92,6 +92,7 @@ def build_snapshot() -> dict:
         int((datetime.now() - _last_check).total_seconds()) if _last_check is not None else None
     )
     providers = get_manager().status_snapshot()
+    learning_snapshot = learning.status_snapshot()
     return {
         "status": "delayed" if _is_delayed() else "ok",
         "uptime_seconds": _uptime_seconds(),
@@ -105,6 +106,7 @@ def build_snapshot() -> dict:
         "duplicates_skipped_today": _duplicates_skipped_today,
         "active_duplicate_entries": dedup.get_active_count(),
         "providers": providers,
+        "learning": learning_snapshot,
         "pid": os.getpid(),
     }
 
@@ -137,6 +139,7 @@ def format_status_message() -> str:
         last_check_line = "🔍 Last price check: not yet run"
 
     providers = snapshot["providers"]
+    learning_snapshot = snapshot["learning"]
 
     def _timestamp(dt: datetime | None) -> str:
         return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else "Never"
@@ -184,6 +187,17 @@ def format_status_message() -> str:
         providers["last_provider_used"],
         f"Total successful failovers today: {providers['total_failovers_today']}",
         f"Total provider failures today: {providers['total_failures_today']}",
+        "",
+        f"🧠 Gemini calls today: {providers['gemini']['calls_today']}",
+        f"⚡ Groq calls today: {providers['groq']['calls_today']}",
+        "📚 Learned rules",
+        f"   Brand rules: {learning_snapshot['brand_rules']}",
+        f"   Brand+Category rules: {learning_snapshot['brand_category_rules']}",
+        f"   Category+Price rules: {learning_snapshot['category_price_rules']}",
+        f"   Category+Discount rules: {learning_snapshot['category_discount_rules']}",
+        f"🎯 AI calls saved today: {learning_snapshot['ai_calls_saved_today']}",
+        f"Learning confidence average: {learning_snapshot['avg_confidence']:.0%}",
+        f"Knowledge base version: {learning_snapshot['kb_version']}",
     ]
     if delayed:
         lines.append("")

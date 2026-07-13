@@ -11,8 +11,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import date, datetime
 
+import database
 from config import MIN_DISCOUNT_FOR_ANALYSIS
+from listener import learning
 from listener.ai_providers import get_manager
 from listener.parser import ParsedDeal
 
@@ -67,6 +70,37 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVe
             provider="none",
         )
 
+    brand = learning.extract_brand(deal.title)
+    guessed_category = learning.guess_category(deal.title)
+    decision = learning.decide(brand, guessed_category, deal.price, deal.discount_percent)
+    stat_date = date.today().isoformat()
+
+    if decision.kind == "rule":
+        database.record_rule_hit(stat_date)
+        database.record_ai_call_saved(stat_date)
+        rule = decision.rule
+        target_multiplier = 0.95 if rule.predicted_quality in ("good", "great") else 1.0
+        logger.info(
+            "learned rule fired (%s=%s, confidence=%.0f%%) — AI call saved",
+            rule.rule_type, rule.key, rule.confidence * 100,
+        )
+        return DealVerdict(
+            deal_quality=rule.predicted_quality,
+            reason=learning.format_explanation(rule, brand, guessed_category),
+            suggested_target=int(deal.price * target_multiplier),
+            category=guessed_category or "other",
+            provider="learned",
+        )
+
+    if decision.kind == "validate":
+        database.record_validation_call(stat_date)
+        logger.info(
+            "validating learned rule (%s=%s, confidence=%.0f%%) with a real AI call",
+            decision.rule.rule_type, decision.rule.key, decision.rule.confidence * 100,
+        )
+    elif decision.had_candidate:
+        database.record_rule_miss(stat_date)
+
     manager = get_manager()
     verdict = await manager.get_verdict(
         raw_text=deal.raw_text,
@@ -78,6 +112,27 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVe
     )
     if verdict is None:
         return None
+
+    if decision.kind == "validate":
+        now = datetime.now()
+        learning.mark_validated(decision.rule.rule_type, decision.rule.key, now)
+        if verdict.deal_quality == decision.rule.predicted_quality:
+            database.record_validation_agreement(stat_date)
+        else:
+            database.record_validation_disagreement(stat_date)
+            logger.info(
+                "validation disagreement: rule predicted %s, AI (%s) said %s",
+                decision.rule.predicted_quality, verdict.provider, verdict.deal_quality,
+            )
+
+    # Every successful real AI verdict becomes training data — fire-and-forget
+    # so this never delays forwarding the deal.
+    learning.spawn_learning_task(
+        asin=deal.asin, provider=verdict.provider, brand=brand, category=verdict.category,
+        title=deal.title, price=deal.price, discount_percent=deal.discount_percent,
+        deal_quality=verdict.deal_quality, reason=verdict.reason,
+        suggested_target=verdict.suggested_target, channel=deal.channel_name,
+    )
 
     return DealVerdict(
         deal_quality=verdict.deal_quality,

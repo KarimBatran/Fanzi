@@ -30,7 +30,7 @@ import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import ADMIN_TELEGRAM_ID, TELEGRAM_BOT_TOKEN
-from listener import ai_providers, pending_deals
+from listener import ai_providers, learning, pending_deals
 from listener import watcher as listener_watcher
 from listener.watcher import start_background_listener
 
@@ -50,6 +50,9 @@ ADMIN_ONLY_COMMANDS = [
     BotCommand("channels", "List watched deal channels"),
     BotCommand("addchannel", "Add a new deal channel"),
     BotCommand("removechannel", "Remove a deal channel"),
+    BotCommand("rules", "List learned rules by confidence"),
+    BotCommand("resetrules", "Clear learned rules (keeps verdict history)"),
+    BotCommand("rebuildrules", "Rebuild learned rules from verdict history"),
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -447,6 +450,72 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(health.format_status_message())
 
 
+def _format_rule_line(row) -> str:
+    type_label = {
+        "brand_category": "Brand + Category",
+        "brand": "Brand",
+        "category_price": "Category + Price",
+        "category_discount": "Category + Discount",
+    }.get(row["rule_type"], row["rule_type"])
+    return (
+        f"{type_label}\n"
+        f"{row['key'].replace('|', ' + ')}\n"
+        f"{row['predicted_quality'].capitalize()}\n"
+        f"{row['confidence']:.0%}\n"
+        f"{row['sample_count']} samples"
+    )
+
+
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    rows = database.list_learned_rules(enabled_only=True)
+    if not rows:
+        await update.message.reply_text("No learned rules yet.")
+        return
+
+    blocks = [_format_rule_line(row) for row in rows]
+    await update.message.reply_text("\n\n".join(blocks))
+
+
+async def resetrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clears learned_rules only — verdict history (the training data) is
+    untouched, so /rebuildrules can always regenerate them later.
+    """
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "This deletes all learned rules (verdict history is kept).\n"
+            "Send /resetrules confirm to proceed."
+        )
+        return
+
+    database.clear_learned_rules()
+    database.bump_kb_version()
+    await update.message.reply_text("✅ Learned rules cleared. Verdict history is intact.")
+
+
+async def rebuildrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.message.reply_text("This command is restricted.")
+        return
+
+    await update.message.reply_text("🔄 Rebuilding learned rules from verdict history...")
+
+    async def _run() -> None:
+        verdict_count, rule_count = await asyncio.to_thread(learning.rebuild_rules_from_history)
+        await update.message.reply_text(
+            f"✅ Rebuild complete.\nReplayed {verdict_count} verdicts.\n{rule_count} rules active."
+        )
+
+    asyncio.create_task(_run())
+
+
 async def _post_init(application: Application) -> None:
     await application.bot.set_my_commands(PUBLIC_COMMANDS)
     if ADMIN_TELEGRAM_ID != 0:
@@ -540,6 +609,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("channels", channels))
     application.add_handler(CommandHandler("addchannel", addchannel))
     application.add_handler(CommandHandler("removechannel", removechannel))
+    application.add_handler(CommandHandler("rules", rules))
+    application.add_handler(CommandHandler("resetrules", resetrules))
+    application.add_handler(CommandHandler("rebuildrules", rebuildrules))
 
     application.add_error_handler(on_error)
 

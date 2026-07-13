@@ -47,3 +47,19 @@ AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("AI_CIRCUIT_BREAKER_COOLDOWN
 # cooldown and sends a probe proactively, instead of waiting for the next
 # real deal to trigger it.
 AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS = int(os.getenv("AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS", "60"))
+
+# Self-improving knowledge engine (listener/learning.py) — thresholds only,
+# never a substitute for calling Gemini/Groq; see that module's docstring.
+BRANDS_FILE = os.getenv("BRANDS_FILE", "data/brands.json")
+RULE_MIN_SAMPLES = int(os.getenv("RULE_MIN_SAMPLES", "5"))
+RULE_BRAND_CONFIDENCE = float(os.getenv("RULE_BRAND_CONFIDENCE", "0.80"))
+RULE_BRAND_CATEGORY_CONFIDENCE = float(os.getenv("RULE_BRAND_CATEGORY_CONFIDENCE", "0.85"))
+RULE_PRICE_CONFIDENCE = float(os.getenv("RULE_PRICE_CONFIDENCE", "0.80"))
+RULE_DISCOUNT_CONFIDENCE = float(os.getenv("RULE_DISCOUNT_CONFIDENCE", "0.75"))
+RULE_MONTHLY_DECAY = float(os.getenv("RULE_MONTHLY_DECAY", "0.98"))
+RULE_VALIDATION_RATE_HIGH = float(os.getenv("RULE_VALIDATION_RATE_HIGH", "0.02"))
+RULE_VALIDATION_RATE_MEDIUM = float(os.getenv("RULE_VALIDATION_RATE_MEDIUM", "0.10"))
+RULE_OUTLIER_DISCOUNT = int(os.getenv("RULE_OUTLIER_DISCOUNT", "50"))
+# Not explicitly named in the original spec's config list, but required by
+# its own "extremely low price" outlier condition — same env-driven pattern.
+RULE_OUTLIER_MIN_PRICE = float(os.getenv("RULE_OUTLIER_MIN_PRICE", "30"))

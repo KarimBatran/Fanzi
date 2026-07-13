@@ -69,14 +69,15 @@ def _strip_affiliate_tag(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query_pairs), ""))
 
 
-def _format_message(deal: ParsedDeal, verdict_text: str, clean_url: str) -> str:
+def _format_message(deal: ParsedDeal, verdict_text: str, clean_url: str, *, verdict_is_explanation: bool = False) -> str:
     discount_badge = f" (-{deal.discount_percent}%)" if deal.discount_percent else ""
+    verdict_line = verdict_text if verdict_is_explanation else f"📊 Verdict: {verdict_text}"
     lines = [
         f"🔍 Deal from @{deal.channel_name}",
         "",
         deal.title,
         f"💰 {deal.price:g} EGP{discount_badge}",
-        f"📊 Verdict: {verdict_text}",
+        verdict_line,
         "",
         clean_url,
     ]
@@ -140,9 +141,14 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
         return
 
-    emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
-    verdict_text = f"{emoji} {verdict.reason}"
-    message = _format_message(deal, verdict_text, clean_url)
+    if verdict.provider == "learned":
+        # Honest about the source — never presented as if AI just analyzed
+        # this deal (see listener/learning.py's format_explanation()).
+        message = _format_message(deal, verdict.reason, clean_url, verdict_is_explanation=True)
+    else:
+        emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
+        verdict_text = f"{emoji} {verdict.reason}"
+        message = _format_message(deal, verdict_text, clean_url)
     logger.info("[%s] Forwarding to admin", channel_name)
     await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
 

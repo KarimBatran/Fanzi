@@ -421,6 +421,22 @@ async def checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Check cycle complete.")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler — logs which update (and callback_data, if any)
+    triggered the exception, instead of relying on PTB's generic "No error
+    handlers are registered" fallback which doesn't show that context.
+    """
+    callback_data = None
+    if isinstance(update, Update) and update.callback_query is not None:
+        callback_data = update.callback_query.data
+    logger.error(
+        "unhandled exception processing update (callback_data=%r): %s",
+        callback_data,
+        context.error,
+        exc_info=context.error,
+    )
+
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Live health snapshot. Restricted to ADMIN_TELEGRAM_ID, same as /checkall."""
     if ADMIN_TELEGRAM_ID == 0 or update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -515,6 +531,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("addchannel", addchannel))
     application.add_handler(CommandHandler("removechannel", removechannel))
 
+    application.add_error_handler(on_error)
+
     return application
 
 
@@ -522,7 +540,17 @@ def main() -> None:
     database.init_db()
     application = build_application()
     logger.info("Fanzi bot starting (polling)...")
-    application.run_polling()
+    # Telegram's allowed_updates filter set by any past getUpdates/setWebhook
+    # call persists server-side indefinitely (across restarts and deploys)
+    # until a call explicitly overrides it. This bot's getWebhookInfo showed
+    # allowed_updates=["message", "pre_checkout_query"] — callback_query
+    # (every inline button press, including Track Price) was silently
+    # excluded, so Telegram never delivered those updates at all: the
+    # handler never ran, query.answer() was never reached, and the client
+    # just spun forever waiting for an acknowledgement that could never
+    # come. Passing ALL_TYPES here forces every getUpdates call to
+    # re-request the full set, overriding whatever restriction is stuck.
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

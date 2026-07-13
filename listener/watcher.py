@@ -44,7 +44,7 @@ from config import (
     TELETHON_SESSION_NAME,
 )
 from listener import channels_store, dedup, pending_deals
-from listener.analyzer import analyze_deal, meets_min_quality
+from listener.analyzer import analyze_deal, get_quota_status, meets_min_quality
 from listener.parser import ParsedDeal, extract_from_post
 
 logger = logging.getLogger("fanzi.listener.watcher")
@@ -116,8 +116,17 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
 
     if verdict is None:
         logger.info("[%s] Gemini unavailable — forwarding without verdict", channel_name)
-        # Analysis API failed/skipped — forward the raw deal without a verdict rather than dropping it.
-        message = _format_message(deal, "unavailable (analysis failed)", clean_url)
+        # Analysis skipped/failed for one of several reasons — forward the raw
+        # deal without a verdict rather than dropping it, but distinguish
+        # "Google's daily quota is used up" (expected, not an app bug) from an
+        # actual API/parser failure so the admin isn't misled into thinking
+        # something is broken every time the free-tier quota runs out.
+        quota = get_quota_status()
+        if quota["external_quota_exhausted"] or quota["remaining"] <= 0:
+            verdict_text = "unavailable (daily Gemini quota reached)"
+        else:
+            verdict_text = "unavailable (analysis failed)"
+        message = _format_message(deal, verdict_text, clean_url)
         await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
         logger.info("[%s] Forwarding to admin", channel_name)
         return

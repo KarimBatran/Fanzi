@@ -9,6 +9,7 @@ informational field callers are free to ignore).
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from config import MIN_DISCOUNT_FOR_ANALYSIS
@@ -44,6 +45,14 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
     Cheap checks (no price, low discount) run before any provider is touched,
     exactly as before this module started delegating to AIProviderManager.
     """
+    start = time.monotonic()
+    try:
+        return await _analyze_deal(deal, price_history)
+    finally:
+        logger.debug("End-to-end analysis duration: %.0f ms", (time.monotonic() - start) * 1000)
+
+
+async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVerdict | None:
     if deal.price is None or deal.price <= 0:
         logger.info("skipped analysis (no price)")
         return None

@@ -138,6 +138,9 @@ def format_status_message() -> str:
 
     providers = snapshot["providers"]
 
+    def _timestamp(dt: datetime | None) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else "Never"
+
     def _provider_lines(name: str, p: dict) -> list[str]:
         latency = f"{int(p['avg_latency_ms'])} ms" if p["avg_latency_ms"] is not None else "n/a"
         cooldown = (
@@ -151,6 +154,8 @@ def format_status_message() -> str:
             f"Calls today: {p['calls_today']}",
             f"Failures: {p['consecutive_failures']}",
             f"Latency: {latency}",
+            f"Last success: {_timestamp(p['last_success'])}",
+            f"Last failure: {_timestamp(p['last_failure'])}",
             f"Cooldown: {cooldown}",
             f"Quota: {'Available' if p['quota_available'] else 'EXHAUSTED'}",
             f"API Key: {'Yes' if p['api_key_configured'] else 'No'}",
@@ -171,12 +176,14 @@ def format_status_message() -> str:
         "🧠 AI Providers",
         *_provider_lines("Gemini", providers["gemini"]),
         *_provider_lines("Groq", providers["groq"]),
-        "Current provider:",
-        providers["current_provider"],
-        "Fallback:",
-        providers["fallback"],
+        "Current primary provider:",
+        providers["current_primary"],
+        "Current fallback provider:",
+        providers["current_fallback"],
         "Last provider used:",
         providers["last_provider_used"],
+        f"Total successful failovers today: {providers['total_failovers_today']}",
+        f"Total provider failures today: {providers['total_failures_today']}",
     ]
     if delayed:
         lines.append("")

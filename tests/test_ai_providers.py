@@ -8,6 +8,7 @@ here we go further and patch each provider's `generate()` directly.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -268,7 +269,7 @@ async def test_startup_with_missing_api_key_disables_provider(monkeypatch):
     manager = _manager()
 
     assert manager.health["groq"].disabled is True
-    assert manager.status_snapshot()["groq"]["status"] == "DISABLED (missing API key)"
+    assert manager.status_snapshot()["groq"]["status"] == "DISABLED"
     assert manager.status_snapshot()["groq"]["api_key_configured"] is False
 
     # A disabled provider must never be attempted, even as a fallback.
@@ -316,3 +317,118 @@ async def test_unhealthy_provider_skipped_without_any_retry_attempt():
     gemini_generate.assert_not_called()
     assert verdict is not None
     assert verdict.provider == "groq"
+
+
+@pytest.mark.asyncio
+async def test_background_recovery_probes_only_after_cooldown_expires():
+    """probe_if_ready() (what the background recovery loop calls on a timer)
+    must be a no-op while the cooldown hasn't expired yet, and send exactly
+    one probe the moment it has — without waiting for a real user request.
+    """
+    manager = _manager()
+    health = manager.health["gemini"]
+    health.healthy = False
+    health.consecutive_failures = 5
+    health.cooldown_until_monotonic = __import__("time").monotonic() + 900  # not expired yet
+
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_VALID_JSON)) as gemini_generate:
+        await manager.probe_if_ready(manager.gemini)
+    gemini_generate.assert_not_called()
+    assert manager.health["gemini"].healthy is False
+
+    # Now expire the cooldown and confirm exactly one probe is sent, and it
+    # recovers the provider.
+    health.cooldown_until_monotonic = 0.0
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_VALID_JSON)) as gemini_generate:
+        await manager.probe_if_ready(manager.gemini)
+    gemini_generate.assert_called_once()
+    assert manager.health["gemini"].healthy is True
+
+
+@pytest.mark.asyncio
+async def test_background_recovery_loop_probes_expired_providers_without_a_request(monkeypatch):
+    """run_background_recovery() must probe an expired-cooldown provider on
+    its own timer — no analyze_deal()/get_verdict() call involved at all.
+    """
+    manager = _manager()
+    health = manager.health["gemini"]
+    health.healthy = False
+    health.consecutive_failures = 5
+    health.cooldown_until_monotonic = 0.0  # already expired
+
+    sleep_calls = 0
+
+    async def _fake_sleep(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 1:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("listener.ai_providers.asyncio.sleep", _fake_sleep)
+
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_VALID_JSON)) as gemini_generate:
+        with pytest.raises(asyncio.CancelledError):
+            await manager.run_background_recovery()
+
+    gemini_generate.assert_called_once()
+    assert manager.health["gemini"].healthy is True
+
+
+def test_startup_summary_logged_once(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="fanzi.listener.ai_providers"):
+        manager = _manager()
+        manager.log_startup_summary()
+
+    summary_logs = [r for r in caplog.records if "AI Providers" in r.message]
+    assert len(summary_logs) == 1
+    assert "Primary provider:" in summary_logs[0].message
+    assert "Fallback:" in summary_logs[0].message
+
+
+@pytest.mark.asyncio
+async def test_provider_statistics_persist_across_a_fresh_manager_instance():
+    """Simulates a restart: stats recorded via one AIProviderManager/provider
+    instance must be visible from a brand-new instance reading the same
+    (test) database — proving they're not just in-memory.
+    """
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_VALID_JSON)):
+        await _get_verdict(manager)
+
+    import database
+    from listener.ai_providers import _today
+
+    stats_before_restart = database.get_provider_stats("gemini", _today())
+    assert stats_before_restart["successful_requests"] == 1
+
+    # A brand-new manager/provider pair, as if the process had restarted.
+    fresh_manager = _manager()
+    stats_after_restart = database.get_provider_stats("gemini", _today())
+    assert stats_after_restart["successful_requests"] == 1
+    assert fresh_manager.gemini.calls_today() == 1  # gemini_quota table also survives
+
+
+@pytest.mark.asyncio
+async def test_provider_statistics_track_failures_retries_and_failovers(monkeypatch):
+    import database
+    from listener.ai_providers import _today
+
+    manager = _manager()
+    monkeypatch.setattr("listener.ai_providers.asyncio.sleep", AsyncMock())
+
+    with patch.object(
+        manager.gemini, "generate", new=AsyncMock(side_effect=TransientProviderError("down"))
+    ), patch.object(manager.groq, "generate", new=AsyncMock(return_value=_VALID_JSON)):
+        verdict = await _get_verdict(manager)
+
+    assert verdict is not None
+    assert verdict.provider == "groq"
+
+    gemini_stats = database.get_provider_stats("gemini", _today())
+    groq_stats = database.get_provider_stats("groq", _today())
+    assert gemini_stats["failed_requests"] == 4  # 1 initial + 3 retries
+    assert gemini_stats["total_retries"] == 3
+    assert groq_stats["successful_requests"] == 1
+    assert groq_stats["total_failovers"] == 1

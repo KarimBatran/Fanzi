@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -29,7 +30,7 @@ import scheduler as scheduler_module
 from amazon.parser import extract_asin, normalize_product_url
 from amazon.tracker import ProductFetchError, fetch_product, format_price
 from config import ADMIN_TELEGRAM_ID, TELEGRAM_BOT_TOKEN
-from listener import pending_deals
+from listener import ai_providers, pending_deals
 from listener import watcher as listener_watcher
 from listener.watcher import start_background_listener
 
@@ -457,6 +458,10 @@ async def _post_init(application: Application) -> None:
         "command menu registered (admin scope: %s)", "enabled" if ADMIN_TELEGRAM_ID else "disabled"
     )
 
+    ai_manager = ai_providers.get_manager()
+    ai_manager.log_startup_summary()
+    application.bot_data["ai_recovery_task"] = asyncio.create_task(ai_manager.run_background_recovery())
+
     sched = scheduler_module.build_scheduler(application.bot)
     sched.start()
     application.bot_data["scheduler"] = sched
@@ -486,6 +491,11 @@ async def _post_shutdown(application: Application) -> None:
     if telethon_client is not None:
         await telethon_client.disconnect()
         logger.info("deal listener stopped")
+
+    ai_recovery_task = application.bot_data.get("ai_recovery_task")
+    if ai_recovery_task is not None:
+        ai_recovery_task.cancel()
+        logger.info("AI provider background recovery stopped")
 
 
 def build_application() -> Application:

@@ -59,6 +59,27 @@ CREATE TABLE IF NOT EXISTS groq_quota (
     external_quota_exhausted INTEGER NOT NULL DEFAULT 0
 );
 
+-- Per-provider, per-day analytics (listener/ai_providers.py) — separate from
+-- gemini_quota/groq_quota (which track raw call counts/quota state used for
+-- provider selection) so this table is purely observational: successes,
+-- failures, retries, circuit-breaker trips, and failovers-to-this-provider,
+-- plus a running latency sum/count for the average shown in /status.
+-- Keyed by (provider, stat_date) so both "today's" numbers and all-time
+-- history (via SUM across dates) are available, and everything survives
+-- restarts automatically since it's plain SQLite state.
+CREATE TABLE IF NOT EXISTS provider_stats (
+    provider TEXT NOT NULL,
+    stat_date TEXT NOT NULL,
+    successful_requests INTEGER NOT NULL DEFAULT 0,
+    failed_requests INTEGER NOT NULL DEFAULT 0,
+    quota_exhaustion_events INTEGER NOT NULL DEFAULT 0,
+    circuit_breaker_activations INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms REAL NOT NULL DEFAULT 0,
+    total_retries INTEGER NOT NULL DEFAULT 0,
+    total_failovers INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, stat_date)
+);
+
 -- Last-seen state per (channel, product) for duplicate-deal detection.
 -- identifier is "asin:<ASIN>" or "title:<normalized title>" when no ASIN
 -- was available. Re-processing updates price/discount/seen_at in place.
@@ -338,6 +359,80 @@ def reset_groq_external_quota(quota_date: str) -> None:
             "UPDATE groq_quota SET external_quota_exhausted = 0 WHERE quota_date = ?",
             (quota_date,),
         )
+
+
+def _bump_provider_stat(provider: str, stat_date: str, column: str, delta: float = 1) -> None:
+    # `column` is always one of the fixed literals below (never user input),
+    # so building the SQL with an f-string here is safe.
+    assert column in (
+        "successful_requests",
+        "failed_requests",
+        "quota_exhaustion_events",
+        "circuit_breaker_activations",
+        "total_latency_ms",
+        "total_retries",
+        "total_failovers",
+    )
+    with get_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO provider_stats (provider, stat_date, {column}) VALUES (?, ?, ?)
+            ON CONFLICT(provider, stat_date) DO UPDATE SET {column} = {column} + excluded.{column}
+            """,
+            (provider, stat_date, delta),
+        )
+
+
+def record_provider_success(provider: str, stat_date: str, latency_ms: float) -> None:
+    _bump_provider_stat(provider, stat_date, "successful_requests", 1)
+    _bump_provider_stat(provider, stat_date, "total_latency_ms", latency_ms)
+
+
+def record_provider_failure(provider: str, stat_date: str) -> None:
+    _bump_provider_stat(provider, stat_date, "failed_requests", 1)
+
+
+def record_provider_quota_exhaustion(provider: str, stat_date: str) -> None:
+    _bump_provider_stat(provider, stat_date, "quota_exhaustion_events", 1)
+
+
+def record_provider_circuit_breaker_activation(provider: str, stat_date: str) -> None:
+    _bump_provider_stat(provider, stat_date, "circuit_breaker_activations", 1)
+
+
+def record_provider_retry(provider: str, stat_date: str) -> None:
+    _bump_provider_stat(provider, stat_date, "total_retries", 1)
+
+
+def record_provider_failover(provider: str, stat_date: str) -> None:
+    _bump_provider_stat(provider, stat_date, "total_failovers", 1)
+
+
+def get_provider_stats(provider: str, stat_date: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM provider_stats WHERE provider = ? AND stat_date = ?",
+            (provider, stat_date),
+        ).fetchone()
+    if row is None:
+        return {
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "quota_exhaustion_events": 0,
+            "circuit_breaker_activations": 0,
+            "total_latency_ms": 0.0,
+            "total_retries": 0,
+            "total_failovers": 0,
+        }
+    return {
+        "successful_requests": row["successful_requests"],
+        "failed_requests": row["failed_requests"],
+        "quota_exhaustion_events": row["quota_exhaustion_events"],
+        "circuit_breaker_activations": row["circuit_breaker_activations"],
+        "total_latency_ms": row["total_latency_ms"],
+        "total_retries": row["total_retries"],
+        "total_failovers": row["total_failovers"],
+    }
 
 
 def get_duplicate_record(channel_name: str, identifier: str) -> sqlite3.Row | None:

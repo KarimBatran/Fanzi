@@ -10,16 +10,20 @@ Architecture:
   exceptions into the shared ProviderError hierarchy (TransientProviderError
   = retry-worthy, QuotaExhaustedError = external quota gone, FatalProviderError
   = anything else, e.g. auth/invalid request).
-- ProviderHealth: per-provider circuit breaker + latency/call bookkeeping.
-  A provider with no configured API key is permanently `disabled` at
-  startup — never instantiated against a real client, never attempted.
+- ProviderHealth: per-provider circuit breaker + latency/call bookkeeping
+  (in-memory, resets on restart). A provider with no configured API key is
+  permanently `disabled` at startup — never instantiated against a real
+  client, never attempted.
+- database.provider_stats: cumulative, per-day analytics (successes,
+  failures, retries, circuit-breaker trips, failovers, latency sum) that
+  DO survive restarts, separate from the in-memory ProviderHealth.
 - AIProviderManager: retry policy, circuit breaker enforcement, and the
   Gemini-then-Groq selection order — the only thing listener.analyzer talks
   to. Selection is health-based, not "always try Gemini first no matter
   what": an unhealthy/quota-exhausted/disabled provider is skipped entirely
-  (no wasted request), and a provider that's been in cooldown automatically
-  gets exactly one probe once its cooldown expires, resuming normal use the
-  moment that probe succeeds.
+  (no wasted request). run_background_recovery() proactively probes a
+  provider the moment its cooldown expires, rather than waiting for the
+  next real deal to pay that probe's latency.
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ from groq import (
 
 import database
 from config import (
+    AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS,
     AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
     AI_RETRY_COUNT,
@@ -77,9 +82,21 @@ _DISPLAY_NAME = {"gemini": "Gemini", "groq": "Groq"}
 # How many recent latency samples feed the rolling average shown in /status.
 _LATENCY_WINDOW = 20
 
+# Minimal synthetic content for a proactive background-recovery probe — it
+# only needs to look enough like a real deal post that the model returns a
+# parseable verdict; the verdict itself is discarded.
+_PROBE_CONTENT = (
+    "Probe request — health check only.\n\nParsed: title='probe', price=100 EGP, "
+    "discount=10%, channel=system. No price history available."
+)
+
 
 def _strip_json_fence(text: str) -> str:
     return _JSON_FENCE_RE.sub("", text.strip()).strip()
+
+
+def _today() -> str:
+    return date.today().isoformat()
 
 
 class ProviderError(Exception):
@@ -153,21 +170,17 @@ class GeminiProvider:
             self._client = genai.Client(api_key=GEMINI_API_KEY)
         return self._client
 
-    @staticmethod
-    def _today() -> str:
-        return date.today().isoformat()
-
     def calls_today(self) -> int:
-        return database.get_gemini_quota_count(self._today())
+        return database.get_gemini_quota_count(_today())
 
     def quota_exhausted(self) -> bool:
-        return database.get_gemini_external_quota_exhausted(self._today())
+        return database.get_gemini_external_quota_exhausted(_today())
 
     def mark_quota_exhausted(self) -> None:
-        database.mark_gemini_external_quota_exhausted(self._today())
+        database.mark_gemini_external_quota_exhausted(_today())
 
     def record_call(self) -> None:
-        database.increment_gemini_quota_count(self._today())
+        database.increment_gemini_quota_count(_today())
 
     async def generate(self, user_content: str) -> str:
         client = self._get_client()
@@ -214,21 +227,17 @@ class GroqProvider:
             self._client = AsyncGroq(api_key=GROQ_API_KEY)
         return self._client
 
-    @staticmethod
-    def _today() -> str:
-        return date.today().isoformat()
-
     def calls_today(self) -> int:
-        return database.get_groq_quota_count(self._today())
+        return database.get_groq_quota_count(_today())
 
     def quota_exhausted(self) -> bool:
-        return database.get_groq_external_quota_exhausted(self._today())
+        return database.get_groq_external_quota_exhausted(_today())
 
     def mark_quota_exhausted(self) -> None:
-        database.mark_groq_external_quota_exhausted(self._today())
+        database.mark_groq_external_quota_exhausted(_today())
 
     def record_call(self) -> None:
-        database.increment_groq_quota_count(self._today())
+        database.increment_groq_quota_count(_today())
 
     async def generate(self, user_content: str) -> str:
         client = self._get_client()
@@ -266,6 +275,7 @@ class ProviderHealth:
     healthy: bool = True
     disabled: bool = False  # no API key configured at startup — permanent
     last_success: datetime | None = None
+    last_failure: datetime | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
     last_latency_ms: float | None = None
@@ -294,11 +304,16 @@ class ProviderHealth:
             self._latency_samples.pop(0)
         self.avg_latency_ms = sum(self._latency_samples) / len(self._latency_samples)
 
-    def record_failure(self, error: str) -> None:
+    def record_failure(self, error: str) -> bool:
+        """Returns True if this failure is the one that just opened the
+        circuit breaker (healthy -> unhealthy transition)."""
         self.consecutive_failures += 1
         self.last_error = error
+        self.last_failure = datetime.now()
+        breaker_just_opened = False
         if self.consecutive_failures >= AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD:
             if self.healthy:
+                breaker_just_opened = True
                 logger.warning(
                     "%s entered circuit breaker after %d consecutive failures — "
                     "cooling down %ds",
@@ -308,6 +323,7 @@ class ProviderHealth:
                 )
             self.healthy = False
             self.cooldown_until_monotonic = time.monotonic() + AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+        return breaker_just_opened
 
     def cooldown_remaining_seconds(self) -> float:
         if self.healthy or self.cooldown_until_monotonic is None:
@@ -357,7 +373,28 @@ class AIProviderManager:
             else:
                 logger.info("%s HEALTHY (API key configured)", _DISPLAY_NAME[provider.name])
 
-    async def _attempt(self, provider, user_content: str, max_attempts: int) -> AIVerdict | None:
+    def log_startup_summary(self) -> None:
+        """Logs a single, consolidated startup block — appears exactly once,
+        right after the manager (and its providers' persisted quota state)
+        is ready to serve real requests.
+        """
+        snapshot = self.status_snapshot()
+        lines = [
+            "AI Providers",
+            "Gemini",
+            f"Status: {snapshot['gemini']['status']}",
+            f"Calls today: {snapshot['gemini']['calls_today']}",
+            "Groq",
+            f"Status: {snapshot['groq']['status']}",
+            f"Calls today: {snapshot['groq']['calls_today']}",
+            "Primary provider:",
+            snapshot["current_primary"],
+            "Fallback:",
+            snapshot["current_fallback"],
+        ]
+        logger.info("\n".join(lines))
+
+    async def _attempt(self, provider, user_content: str, max_attempts: int, *, is_probe: bool = False) -> AIVerdict | None:
         """Calls `provider` up to max_attempts times (1 = no retry, used for
         circuit-breaker probes), retrying only TransientProviderError with
         exponential backoff + jitter. Returns the parsed verdict on success,
@@ -365,6 +402,7 @@ class AIProviderManager:
         Quota exhaustion and fatal errors stop immediately (never retried).
         """
         health = self.health[provider.name]
+        stat_date = _today()
         attempt = 0
         while True:
             health.record_attempt()
@@ -378,10 +416,13 @@ class AIProviderManager:
                 # also count it toward consecutive_failures/health.healthy.
                 provider.mark_quota_exhausted()
                 health.last_error = str(exc)
+                database.record_provider_quota_exhaustion(provider.name, stat_date)
                 logger.warning("%s quota exhausted", _DISPLAY_NAME[provider.name])
                 return None
             except TransientProviderError as exc:
-                health.record_failure(str(exc))
+                if health.record_failure(str(exc)):
+                    database.record_provider_circuit_breaker_activation(provider.name, stat_date)
+                database.record_provider_failure(provider.name, stat_date)
                 attempt += 1
                 if attempt >= max_attempts or not health.healthy:
                     logger.error(
@@ -392,6 +433,7 @@ class AIProviderManager:
                     AI_RETRY_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)), AI_RETRY_MAX_BACKOFF_SECONDS
                 )
                 jitter = random.uniform(0, backoff * 0.1)
+                database.record_provider_retry(provider.name, stat_date)
                 logger.warning(
                     "%s transient failure (attempt %d/%d) — retrying in %.2fs",
                     _DISPLAY_NAME[provider.name],
@@ -402,18 +444,37 @@ class AIProviderManager:
                 await asyncio.sleep(backoff + jitter)
                 continue
             except FatalProviderError as exc:
-                health.record_failure(str(exc))
+                if health.record_failure(str(exc)):
+                    database.record_provider_circuit_breaker_activation(provider.name, stat_date)
+                database.record_provider_failure(provider.name, stat_date)
                 logger.error("%s failed (non-retryable): %s", _DISPLAY_NAME[provider.name], exc)
                 return None
 
             latency_ms = (time.monotonic() - start) * 1000
+            logger.debug("%s AI request duration: %.0f ms", _DISPLAY_NAME[provider.name], latency_ms)
+
+            if is_probe:
+                # A background-recovery probe only needs a response that
+                # didn't raise — there's no real deal to parse a verdict
+                # for, so success is judged purely on connectivity/API health.
+                was_unhealthy = not health.healthy
+                health.record_success(latency_ms)
+                provider.record_call()
+                database.record_provider_success(provider.name, stat_date, latency_ms)
+                if was_unhealthy:
+                    logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
+                return None
+
             verdict = _parse_verdict(text, provider.name)
             if verdict is None:
-                health.record_failure("malformed response")
+                if health.record_failure("malformed response"):
+                    database.record_provider_circuit_breaker_activation(provider.name, stat_date)
+                database.record_provider_failure(provider.name, stat_date)
                 return None
             was_unhealthy = not health.healthy
             health.record_success(latency_ms)
             provider.record_call()
+            database.record_provider_success(provider.name, stat_date, latency_ms)
             if was_unhealthy:
                 logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
             return verdict
@@ -436,6 +497,7 @@ class AIProviderManager:
         if groq_verdict is not None:
             self.last_provider_used = "groq"
             logger.info("AIProviderManager selected Groq (Gemini unavailable)")
+            database.record_provider_failover("groq", _today())
             self._log_selection_time(selection_start)
             return groq_verdict
 
@@ -447,6 +509,7 @@ class AIProviderManager:
     def _log_selection_time(selection_start: float) -> None:
         elapsed_ms = (time.monotonic() - selection_start) * 1000
         logger.info("Provider selection completed in %.0f ms", elapsed_ms)
+        logger.debug("Provider selection time: %.0f ms", elapsed_ms)
 
     async def _try_provider(self, provider, user_content: str) -> AIVerdict | None:
         health = self.health[provider.name]
@@ -469,14 +532,43 @@ class AIProviderManager:
 
         return await self._attempt(provider, user_content, max_attempts=AI_RETRY_COUNT + 1)
 
+    async def probe_if_ready(self, provider) -> None:
+        """Used by the background recovery job: sends exactly one probe
+        request if (and only if) this provider's cooldown has expired,
+        without waiting for a real deal to trigger it. No-op otherwise.
+        """
+        health = self.health[provider.name]
+        if health.disabled or provider.quota_exhausted() or not health.is_probe_ready():
+            return
+        logger.info("%s cooldown expired — sending background probe", _DISPLAY_NAME[provider.name])
+        await self._attempt(provider, _PROBE_CONTENT, max_attempts=1, is_probe=True)
+
+    async def run_background_recovery(self) -> None:
+        """Runs forever, polling every AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS
+        for a provider whose cooldown has just expired and probing it
+        immediately — so the first real user request after recovery never
+        pays the probe's latency. Cancelled (via asyncio.CancelledError) on
+        bot shutdown.
+        """
+        while True:
+            await asyncio.sleep(AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS)
+            for provider in (self.gemini, self.groq):
+                try:
+                    await self.probe_if_ready(provider)
+                except Exception:
+                    logger.exception("background recovery probe failed for %s", provider.name)
+
     def status_snapshot(self) -> dict:
         def _status_label(provider, health: ProviderHealth) -> str:
             if health.disabled:
-                return "DISABLED (missing API key)"
+                return "DISABLED"
             if provider.quota_exhausted():
                 return "QUOTA EXHAUSTED"
-            if not health.healthy and not health.is_probe_ready():
-                return "UNHEALTHY"
+            if not health.healthy:
+                # Stays COOLDOWN even once the cooldown window has technically
+                # opened — it only becomes HEALTHY again once a probe (or a
+                # real request) actually succeeds, not merely once one is due.
+                return "COOLDOWN"
             return "HEALTHY"
 
         def _provider_info(provider, health: ProviderHealth) -> dict:
@@ -486,6 +578,7 @@ class AIProviderManager:
                 "calls_today": provider.calls_today(),
                 "consecutive_failures": health.consecutive_failures,
                 "last_success": health.last_success,
+                "last_failure": health.last_failure,
                 "avg_latency_ms": health.avg_latency_ms,
                 "cooldown_remaining_seconds": cooldown_seconds if cooldown_seconds > 0 else None,
                 "quota_available": not provider.quota_exhausted(),
@@ -499,19 +592,49 @@ class AIProviderManager:
             can_attempt, _ = health.can_attempt()
             return can_attempt and not provider.quota_exhausted()
 
-        if _usable(self.gemini, gemini_health):
-            current_provider = "Gemini"
-        elif _usable(self.groq, groq_health):
-            current_provider = "Groq"
+        def _unusable_reason(provider, health: ProviderHealth) -> str:
+            if health.disabled:
+                return "disabled"
+            if provider.quota_exhausted():
+                return "quota exhausted"
+            if not health.healthy:
+                return "cooldown"
+            return ""
+
+        gemini_usable = _usable(self.gemini, gemini_health)
+        groq_usable = _usable(self.groq, groq_health)
+
+        if gemini_usable:
+            current_primary = "Gemini"
+            fallback_name, fallback_provider, fallback_health = "Groq", self.groq, groq_health
+        elif groq_usable:
+            current_primary = "Groq"
+            fallback_name, fallback_provider, fallback_health = "Gemini", self.gemini, gemini_health
         else:
-            current_provider = "None"
+            current_primary = "None"
+            fallback_name, fallback_provider, fallback_health = "Groq", self.groq, groq_health
+
+        fallback_usable = _usable(fallback_provider, fallback_health)
+        current_fallback = (
+            fallback_name if fallback_usable else f"{fallback_name} ({_unusable_reason(fallback_provider, fallback_health)})"
+        )
+
+        today = _today()
+        gemini_stats = database.get_provider_stats("gemini", today)
+        groq_stats = database.get_provider_stats("groq", today)
+        total_failovers_today = gemini_stats["total_failovers"] + groq_stats["total_failovers"]
+        total_failures_today = gemini_stats["failed_requests"] + groq_stats["failed_requests"]
 
         return {
             "gemini": _provider_info(self.gemini, gemini_health),
             "groq": _provider_info(self.groq, groq_health),
-            "current_provider": current_provider,
+            "current_primary": current_primary,
+            "current_fallback": current_fallback,
+            # Kept for backward compatibility with the earlier /status format.
             "fallback": "Groq",
             "last_provider_used": _DISPLAY_NAME.get(self.last_provider_used, "None"),
+            "total_failovers_today": total_failovers_today,
+            "total_failures_today": total_failures_today,
         }
 
     def both_quota_exhausted(self) -> bool:

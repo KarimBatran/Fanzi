@@ -43,3 +43,7 @@ AI_RETRY_INITIAL_BACKOFF_SECONDS = float(os.getenv("AI_RETRY_INITIAL_BACKOFF_SEC
 AI_RETRY_MAX_BACKOFF_SECONDS = float(os.getenv("AI_RETRY_MAX_BACKOFF_SECONDS", "4"))
 AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5"))
 AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.getenv("AI_CIRCUIT_BREAKER_COOLDOWN_MINUTES", "15")) * 60
+# How often the background recovery job checks for an expired provider
+# cooldown and sends a probe proactively, instead of waiting for the next
+# real deal to trigger it.
+AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS = int(os.getenv("AI_BACKGROUND_RECOVERY_INTERVAL_SECONDS", "60"))

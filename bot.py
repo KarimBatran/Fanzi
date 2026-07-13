@@ -59,7 +59,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("fanzi.bot")
 
 WAITING_URL, WAITING_TARGET = range(2)
-CHOOSING_TARGET, WAITING_CUSTOM_TARGET = range(2, 4)
 
 TARGET_PERCENTAGE_OPTIONS = (10, 20, 25)
 
@@ -158,10 +157,19 @@ def _target_choice_keyboard(asin: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def track_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for the 📉 Track Price button on a forwarded deal. Does
-    not create a tracker yet — first checks for an existing one, then asks
-    the user to choose a target price.
+async def track_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for the 📉 Track Price button on a forwarded deal. Does not
+    create a tracker yet — first checks for an existing one, then asks the
+    user to choose a target price.
+
+    Deliberately NOT a ConversationHandler: deals are forwarded continuously
+    and the admin may click Track Price on a new deal before finishing the
+    target-price flow for an earlier one. A ConversationHandler only tracks
+    one active state per (chat, user) — a second "track:" button press
+    while still "in conversation" for the first deal would silently match
+    no state handler and do nothing. Using plain handlers plus pending_deals
+    (keyed by ASIN, not by conversation) keeps every button independently
+    responsive regardless of what other deals are mid-flow.
     """
     query = update.callback_query
     await query.answer()
@@ -170,23 +178,19 @@ async def track_button_pressed(update: Update, context: ContextTypes.DEFAULT_TYP
     user = database.get_or_create_user(update.effective_user.id, update.effective_user.username)
     if database.get_tracked_product_by_asin(user.id, asin) is not None:
         await query.message.reply_text("✅ You're already tracking this product.")
-        return ConversationHandler.END
+        return
 
     deal = pending_deals.get(asin)
     if deal is None:
         await query.message.reply_text(
             "This deal has expired — use /track to add this product manually."
         )
-        return ConversationHandler.END
-
-    context.user_data["track_asin"] = asin
-    context.user_data["track_deal"] = deal
+        return
 
     await query.message.reply_text(
         f"Current price: {format_price(deal['price'])} EGP\n\nChoose a target price:",
         reply_markup=_target_choice_keyboard(asin),
     )
-    return CHOOSING_TARGET
 
 
 async def _create_tracker_and_confirm(
@@ -202,8 +206,8 @@ async def _create_tracker_and_confirm(
         target_price=target_price,
     )
     pending_deals.pop(asin)
-    context.user_data.pop("track_asin", None)
-    context.user_data.pop("track_deal", None)
+    if context.user_data.get("awaiting_custom_target_asin") == asin:
+        context.user_data.pop("awaiting_custom_target_asin", None)
 
     message = update.callback_query.message if update.callback_query else update.message
     await message.reply_text(
@@ -213,58 +217,66 @@ async def _create_tracker_and_confirm(
     )
 
 
-async def target_percentage_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def target_percentage_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     _, asin, pct_str = query.data.split(":")
 
-    deal = context.user_data.get("track_deal")
+    deal = pending_deals.get(asin)
     if deal is None:
         await query.message.reply_text(
             "This deal has expired — use /track to add this product manually."
         )
-        return ConversationHandler.END
+        return
 
     target_price = deal["price"] * (1 - int(pct_str) / 100)
     await _create_tracker_and_confirm(update, context, asin, deal, target_price)
-    return ConversationHandler.END
 
 
-async def target_custom_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def target_custom_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    asin = query.data.split(":")[1]
+    context.user_data["awaiting_custom_target_asin"] = asin
     await query.message.reply_text("Send the target price as a number, e.g. 1500")
-    return WAITING_CUSTOM_TARGET
 
 
-async def target_custom_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def maybe_custom_target_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Only acts when the user has an outstanding "Custom price" prompt
+    (set by target_custom_prompt above) — otherwise silently ignores the
+    text message so it doesn't interfere with /track's own conversation or
+    any other plain text.
+    """
+    asin = context.user_data.get("awaiting_custom_target_asin")
+    if asin is None:
+        return
+
     try:
         target_price = float(update.message.text.strip().replace(",", ""))
         if target_price <= 0:
             raise ValueError
     except ValueError:
         await update.message.reply_text("That doesn't look like a valid price. Send a number, e.g. 1500")
-        return WAITING_CUSTOM_TARGET
+        return
 
-    asin = context.user_data.get("track_asin")
-    deal = context.user_data.get("track_deal")
-    if asin is None or deal is None:
+    deal = pending_deals.get(asin)
+    if deal is None:
+        context.user_data.pop("awaiting_custom_target_asin", None)
         await update.message.reply_text(
             "This deal has expired — use /track to add this product manually."
         )
-        return ConversationHandler.END
+        return
 
     await _create_tracker_and_confirm(update, context, asin, deal, target_price)
-    return ConversationHandler.END
 
 
-async def target_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def target_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    asin = query.data.split(":")[1]
+    if context.user_data.get("awaiting_custom_target_asin") == asin:
+        context.user_data.pop("awaiting_custom_target_asin", None)
     await query.message.reply_text("Cancelled — nothing was tracked.")
-    context.user_data.pop("track_asin", None)
-    context.user_data.pop("track_deal", None)
-    return ConversationHandler.END
 
 
 async def mytracks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -478,22 +490,20 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", track_cancel)],
     )
 
-    track_button_conversation = ConversationHandler(
-        entry_points=[CallbackQueryHandler(track_button_pressed, pattern=r"^track:")],
-        states={
-            CHOOSING_TARGET: [
-                CallbackQueryHandler(target_percentage_chosen, pattern=r"^target:[^:]+:(10|20|25)$"),
-                CallbackQueryHandler(target_custom_prompt, pattern=r"^target:[^:]+:custom$"),
-                CallbackQueryHandler(target_cancelled, pattern=r"^target:[^:]+:cancel$"),
-            ],
-            WAITING_CUSTOM_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, target_custom_received)],
-        },
-        fallbacks=[CommandHandler("cancel", track_cancel)],
-    )
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(track_conversation)
-    application.add_handler(track_button_conversation)
+
+    # Plain handlers, not a ConversationHandler — see the docstring on
+    # track_button_pressed for why (deals forward continuously, so more than
+    # one Track Price flow can be mid-flight for the same admin at once).
+    application.add_handler(CallbackQueryHandler(track_button_pressed, pattern=r"^track:"))
+    application.add_handler(CallbackQueryHandler(target_percentage_chosen, pattern=r"^target:[^:]+:(10|20|25)$"))
+    application.add_handler(CallbackQueryHandler(target_custom_prompt, pattern=r"^target:[^:]+:custom$"))
+    application.add_handler(CallbackQueryHandler(target_cancelled, pattern=r"^target:[^:]+:cancel$"))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_custom_target_received), group=1
+    )
+
     application.add_handler(CommandHandler("mytracks", mytracks))
     application.add_handler(CommandHandler("remove", remove))
     application.add_handler(CommandHandler("pause", pause))

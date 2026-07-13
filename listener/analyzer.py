@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ import database
 from config import (
     DAILY_ANALYSIS_CAP,
     GEMINI_API_KEY,
+    GEMINI_RETRY_COUNT,
+    GEMINI_RETRY_INITIAL_BACKOFF_SECONDS,
+    GEMINI_RETRY_MAX_BACKOFF_SECONDS,
     MIN_DISCOUNT_FOR_ANALYSIS,
     RATE_LIMIT_PER_MIN,
 )
@@ -68,9 +72,10 @@ class QuotaGuard:
     for a slot that will never come).
 
     The per-minute count is in-memory only (a 60s window losing its history
-    on restart is harmless). The daily count is persisted in the
-    gemini_quota table, keyed by date, so restarts don't reset it and it
-    naturally resets at local midnight (a new day is just a fresh row).
+    on restart is harmless). The daily count — and whether Google's own
+    quota has been reported exhausted — are persisted in the gemini_quota
+    table, keyed by date, so restarts don't reset them and both naturally
+    reset at local midnight (a new day is just a fresh row).
     """
 
     def __init__(self, rate_limit_per_min: int, daily_cap: int) -> None:
@@ -92,6 +97,16 @@ class QuotaGuard:
 
     def daily_quota_reached(self) -> bool:
         return self.daily_count() >= self.daily_cap
+
+    def external_quota_exhausted(self) -> bool:
+        """Whether Google itself has reported RESOURCE_EXHAUSTED today —
+        distinct from `daily_quota_reached()`, which is purely our own
+        self-imposed `daily_cap` and may not reflect Google's real limit.
+        """
+        return database.get_gemini_external_quota_exhausted(self._today())
+
+    def mark_external_quota_exhausted(self) -> None:
+        database.mark_gemini_external_quota_exhausted(self._today())
 
     async def acquire(self) -> None:
         """Waits until a call slot is available under the per-minute rate
@@ -126,13 +141,16 @@ def _get_client() -> genai.Client:
 
 
 def get_quota_status() -> dict:
-    """Snapshot for /status — {daily_count, daily_cap, remaining, minute_count}."""
+    """Snapshot for /status — internal counter/cap plus Google's own
+    (externally reported) quota state, kept clearly distinct.
+    """
     daily_count = _quota_guard.daily_count()
     return {
         "daily_count": daily_count,
         "daily_cap": _quota_guard.daily_cap,
         "remaining": max(0, _quota_guard.daily_cap - daily_count),
         "minute_count": _quota_guard.minute_count(),
+        "external_quota_exhausted": _quota_guard.external_quota_exhausted(),
     }
 
 
@@ -142,13 +160,21 @@ def _strip_json_fence(text: str) -> str:
 
 async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVerdict | None:
     """Returns a DealVerdict, or None if analysis couldn't be completed (API
-    failure, timeout, or daily quota exhausted) — callers fall back to
-    forwarding the raw deal with an "unavailable" verdict rather than
-    dropping it. A low-discount post gets a synthetic "average" verdict
-    instead — a neutral, non-biased quality assessment (not a hard-coded
-    "skip") that goes through the exact same MIN_DEAL_QUALITY filter as a
-    real Gemini verdict would, so skipping Gemini never *automatically*
-    suppresses the deal on its own.
+    failure, timeout, internal daily cap reached, or Google's own quota
+    exhausted) — callers fall back to forwarding the raw deal with an
+    "unavailable" verdict rather than dropping it. A low-discount post gets
+    a synthetic "average" verdict instead — a neutral, non-biased quality
+    assessment (not a hard-coded "skip") that goes through the exact same
+    MIN_DEAL_QUALITY filter as a real Gemini verdict would, so skipping
+    Gemini never *automatically* suppresses the deal on its own.
+
+    A RESOURCE_EXHAUSTED response means Google's real quota — which may not
+    match our own DAILY_ANALYSIS_CAP — has been used up; further calls for
+    the rest of the day are guaranteed to fail, so that state is recorded
+    and checked up front on every subsequent call instead of repeating a
+    doomed request. UNAVAILABLE (transient server-side overload) is retried
+    with exponential backoff and jitter; every other APIError status
+    (auth failures, invalid requests, ...) fails immediately, unretried.
     """
     if deal.price is None or deal.price <= 0:
         logger.info("skipped analysis (no price)")
@@ -167,7 +193,9 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
         logger.warning("daily quota reached, forwarding without analysis")
         return None
 
-    await _quota_guard.acquire()
+    if _quota_guard.external_quota_exhausted():
+        logger.warning("Gemini external quota exhausted — skipping further analysis")
+        return None
 
     history_line = (
         f"Previously tracked price: {price_history:g} EGP." if price_history is not None else "No price history available."
@@ -179,33 +207,65 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
         f"{history_line}"
     )
 
-    try:
-        client = _get_client()
-        response = await client.aio.models.generate_content(
-            model=_MODEL,
-            contents=user_content,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                max_output_tokens=256,
-                # This is a simple structured-extraction task — extended
-                # thinking just burns quota/tokens for no benefit (it was
-                # consuming the entire budget before any visible output).
-                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-    except genai_errors.APIError as exc:
-        logger.error(
-            "deal analysis failed for ASIN %s: model=%s status=%s message=%s",
-            deal.asin,
-            _MODEL,
-            exc.status,
-            exc.message,
-        )
-        return None
-    except Exception:
-        logger.exception("deal analysis failed for ASIN %s (model=%s)", deal.asin, _MODEL)
-        return None
+    response = None
+    attempt = 0
+    while True:
+        await _quota_guard.acquire()
+        try:
+            client = _get_client()
+            response = await client.aio.models.generate_content(
+                model=_MODEL,
+                contents=user_content,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    max_output_tokens=256,
+                    # This is a simple structured-extraction task — extended
+                    # thinking just burns quota/tokens for no benefit (it was
+                    # consuming the entire budget before any visible output).
+                    thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                ),
+            )
+            break
+        except genai_errors.APIError as exc:
+            if exc.status == "RESOURCE_EXHAUSTED":
+                # Google's own quota, not our self-imposed daily_cap — further
+                # requests today are guaranteed to fail, so stop making them
+                # rather than wasting attempts (and Gemini rate-limit budget)
+                # on a call that can't succeed until the window resets.
+                _quota_guard.mark_external_quota_exhausted()
+                logger.warning("Gemini external quota exhausted — skipping further analysis")
+                return None
+
+            # Only RESOURCE_EXHAUSTED's sibling UNAVAILABLE (transient
+            # server-side overload) is worth retrying — auth failures,
+            # invalid requests, etc. will just fail the same way again.
+            if exc.status != "UNAVAILABLE" or attempt >= GEMINI_RETRY_COUNT:
+                logger.error(
+                    "deal analysis failed for ASIN %s: model=%s status=%s message=%s",
+                    deal.asin,
+                    _MODEL,
+                    exc.status,
+                    exc.message,
+                )
+                return None
+
+            backoff = min(
+                GEMINI_RETRY_INITIAL_BACKOFF_SECONDS * (2**attempt), GEMINI_RETRY_MAX_BACKOFF_SECONDS
+            )
+            jitter = random.uniform(0, backoff * 0.1)
+            attempt += 1
+            logger.warning(
+                "Gemini UNAVAILABLE for ASIN %s (attempt %d/%d) — retrying in %.2fs",
+                deal.asin,
+                attempt,
+                GEMINI_RETRY_COUNT,
+                backoff + jitter,
+            )
+            await asyncio.sleep(backoff + jitter)
+        except Exception:
+            logger.exception("deal analysis failed for ASIN %s (model=%s)", deal.asin, _MODEL)
+            return None
 
     text = response.text
     if not text:

@@ -38,9 +38,15 @@ CREATE TABLE IF NOT EXISTS tracked_products (
 -- One row per calendar day — the Gemini call count for that day. Keyed by
 -- date so "reset at local midnight" falls out naturally: a new day just
 -- means a new row starting at 0, no explicit reset job needed.
+-- external_quota_exhausted tracks Google's own quota (as opposed to our
+-- internal call_count/DAILY_ANALYSIS_CAP, which is just a self-imposed
+-- ceiling and may not match Google's real limit) — set the moment a
+-- RESOURCE_EXHAUSTED response is seen, so further calls stop being wasted
+-- on a request that's guaranteed to fail. Reset by the same date rollover.
 CREATE TABLE IF NOT EXISTS gemini_quota (
     quota_date TEXT PRIMARY KEY,
-    call_count INTEGER NOT NULL DEFAULT 0
+    call_count INTEGER NOT NULL DEFAULT 0,
+    external_quota_exhausted INTEGER NOT NULL DEFAULT 0
 );
 
 -- Last-seen state per (channel, product) for duplicate-deal detection.
@@ -72,6 +78,17 @@ def get_connection() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA)
+        # Migration for DBs created before external_quota_exhausted existed —
+        # CREATE TABLE IF NOT EXISTS above is a no-op on an existing table,
+        # so an already-created gemini_quota table needs the column added
+        # explicitly. SQLite has no "ADD COLUMN IF NOT EXISTS", so just
+        # swallow the "duplicate column" error on a DB that already has it.
+        try:
+            conn.execute(
+                "ALTER TABLE gemini_quota ADD COLUMN external_quota_exhausted INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
 
 
 def get_or_create_user(telegram_id: int, username: str | None) -> User:
@@ -229,6 +246,37 @@ def increment_gemini_quota_count(quota_date: str) -> int:
             "SELECT call_count FROM gemini_quota WHERE quota_date = ?", (quota_date,)
         ).fetchone()
         return row["call_count"]
+
+
+def get_gemini_external_quota_exhausted(quota_date: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT external_quota_exhausted FROM gemini_quota WHERE quota_date = ?", (quota_date,)
+        ).fetchone()
+        return bool(row["external_quota_exhausted"]) if row else False
+
+
+def mark_gemini_external_quota_exhausted(quota_date: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO gemini_quota (quota_date, call_count, external_quota_exhausted)
+            VALUES (?, 0, 1)
+            ON CONFLICT(quota_date) DO UPDATE SET external_quota_exhausted = 1
+            """,
+            (quota_date,),
+        )
+
+
+def reset_gemini_external_quota(quota_date: str) -> None:
+    """Manual override — lets an admin declare the external quota available
+    again without waiting for the date to roll over.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE gemini_quota SET external_quota_exhausted = 0 WHERE quota_date = ?",
+            (quota_date,),
+        )
 
 
 def get_duplicate_record(channel_name: str, identifier: str) -> sqlite3.Row | None:

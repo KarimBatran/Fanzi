@@ -31,3 +31,9 @@ RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "12"))
 DAILY_ANALYSIS_CAP = int(os.getenv("DAILY_ANALYSIS_CAP", "1400"))
 MIN_DISCOUNT_FOR_ANALYSIS = int(os.getenv("MIN_DISCOUNT_FOR_ANALYSIS", "10"))
 DUPLICATE_WINDOW_HOURS = int(os.getenv("DUPLICATE_WINDOW_HOURS", "24"))
+
+# Retry behavior for transient Gemini failures (UNAVAILABLE) — not Google's
+# actual quota values, which the app must never assume or hardcode.
+GEMINI_RETRY_COUNT = int(os.getenv("GEMINI_RETRY_COUNT", "3"))
+GEMINI_RETRY_INITIAL_BACKOFF_SECONDS = float(os.getenv("GEMINI_RETRY_INITIAL_BACKOFF_SECONDS", "1"))
+GEMINI_RETRY_MAX_BACKOFF_SECONDS = float(os.getenv("GEMINI_RETRY_MAX_BACKOFF_SECONDS", "4"))

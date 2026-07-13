@@ -1,17 +1,25 @@
-"""Dual-provider AI verdict generation: Gemini is always tried first, Groq is
-the automatic fallback. Everything outside this module (and listener.analyzer,
-which wraps it) is provider-agnostic — callers only ever see analyze_deal()'s
-existing DealVerdict-shaped result, plus a `provider` field saying who
-actually answered.
+"""Dual-provider AI verdict generation: Gemini and Groq, with automatic
+failover between whichever is currently healthiest. Everything outside this
+module (and listener.analyzer, which wraps it) is provider-agnostic —
+callers only ever see analyze_deal()'s existing DealVerdict-shaped result,
+plus a `provider` field saying who actually answered.
 
 Architecture:
-- GeminiProvider / GroqProvider: each knows how to make one raw API call and
-  translate its own SDK's exceptions into the shared ProviderError hierarchy
-  (TransientProviderError = retry-worthy, QuotaExhaustedError = external
-  quota gone, FatalProviderError = anything else, e.g. auth/invalid request).
+- GeminiProvider / GroqProvider: each knows how to make one raw API call,
+  whether it has a configured API key, and how to translate its own SDK's
+  exceptions into the shared ProviderError hierarchy (TransientProviderError
+  = retry-worthy, QuotaExhaustedError = external quota gone, FatalProviderError
+  = anything else, e.g. auth/invalid request).
 - ProviderHealth: per-provider circuit breaker + latency/call bookkeeping.
+  A provider with no configured API key is permanently `disabled` at
+  startup — never instantiated against a real client, never attempted.
 - AIProviderManager: retry policy, circuit breaker enforcement, and the
-  Gemini-then-Groq fallback order — the only thing listener.analyzer talks to.
+  Gemini-then-Groq selection order — the only thing listener.analyzer talks
+  to. Selection is health-based, not "always try Gemini first no matter
+  what": an unhealthy/quota-exhausted/disabled provider is skipped entirely
+  (no wasted request), and a provider that's been in cooldown automatically
+  gets exactly one probe once its cooldown expires, resuming normal use the
+  moment that probe succeeds.
 """
 
 from __future__ import annotations
@@ -63,6 +71,11 @@ _SYSTEM_PROMPT = (
 )
 
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+_DISPLAY_NAME = {"gemini": "Gemini", "groq": "Groq"}
+
+# How many recent latency samples feed the rolling average shown in /status.
+_LATENCY_WINDOW = 20
 
 
 def _strip_json_fence(text: str) -> str:
@@ -130,6 +143,9 @@ class GeminiProvider:
     def __init__(self) -> None:
         self._client: genai.Client | None = None
 
+    def is_configured(self) -> bool:
+        return bool(GEMINI_API_KEY)
+
     def _get_client(self) -> genai.Client:
         # Lazy singleton — constructing genai.Client() raises immediately if
         # GEMINI_API_KEY is empty, so this must not run at import time.
@@ -188,6 +204,9 @@ class GroqProvider:
     def __init__(self) -> None:
         self._client: AsyncGroq | None = None
 
+    def is_configured(self) -> bool:
+        return bool(GROQ_API_KEY)
+
     def _get_client(self) -> AsyncGroq:
         if self._client is None:
             if not GROQ_API_KEY:
@@ -245,12 +264,15 @@ class GroqProvider:
 class ProviderHealth:
     name: str
     healthy: bool = True
+    disabled: bool = False  # no API key configured at startup — permanent
     last_success: datetime | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
     last_latency_ms: float | None = None
+    avg_latency_ms: float | None = None
     cooldown_until_monotonic: float | None = None
     _minute_call_times: list[float] = field(default_factory=list)
+    _latency_samples: list[float] = field(default_factory=list)
 
     def calls_this_minute(self) -> int:
         cutoff = time.monotonic() - 60
@@ -267,6 +289,10 @@ class ProviderHealth:
         self.last_success = datetime.now()
         self.last_latency_ms = latency_ms
         self.cooldown_until_monotonic = None
+        self._latency_samples.append(latency_ms)
+        if len(self._latency_samples) > _LATENCY_WINDOW:
+            self._latency_samples.pop(0)
+        self.avg_latency_ms = sum(self._latency_samples) / len(self._latency_samples)
 
     def record_failure(self, error: str) -> None:
         self.consecutive_failures += 1
@@ -274,14 +300,19 @@ class ProviderHealth:
         if self.consecutive_failures >= AI_CIRCUIT_BREAKER_FAILURE_THRESHOLD:
             if self.healthy:
                 logger.warning(
-                    "circuit breaker OPEN for %s after %d consecutive failures — "
+                    "%s entered circuit breaker after %d consecutive failures — "
                     "cooling down %ds",
-                    self.name,
+                    _DISPLAY_NAME[self.name],
                     self.consecutive_failures,
                     AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS,
                 )
             self.healthy = False
             self.cooldown_until_monotonic = time.monotonic() + AI_CIRCUIT_BREAKER_COOLDOWN_SECONDS
+
+    def cooldown_remaining_seconds(self) -> float:
+        if self.healthy or self.cooldown_until_monotonic is None:
+            return 0.0
+        return max(0.0, self.cooldown_until_monotonic - time.monotonic())
 
     def is_probe_ready(self) -> bool:
         return (
@@ -292,6 +323,8 @@ class ProviderHealth:
 
     def can_attempt(self) -> tuple[bool, bool]:
         """Returns (can_attempt, is_probe)."""
+        if self.disabled:
+            return False, False
         if self.healthy:
             return True, False
         if self.is_probe_ready():
@@ -311,6 +344,18 @@ class AIProviderManager:
             gemini.name: ProviderHealth(gemini.name),
             groq.name: ProviderHealth(groq.name),
         }
+        self.last_provider_used: str | None = None
+
+        # Startup validation: a provider with no configured API key is
+        # permanently disabled — never instantiated against a real client,
+        # never attempted, regardless of circuit-breaker/cooldown state.
+        for provider in (self.gemini, self.groq):
+            health = self.health[provider.name]
+            if not provider.is_configured():
+                health.disabled = True
+                logger.warning("%s DISABLED (missing API key)", _DISPLAY_NAME[provider.name])
+            else:
+                logger.info("%s HEALTHY (API key configured)", _DISPLAY_NAME[provider.name])
 
     async def _attempt(self, provider, user_content: str, max_attempts: int) -> AIVerdict | None:
         """Calls `provider` up to max_attempts times (1 = no retry, used for
@@ -333,14 +378,14 @@ class AIProviderManager:
                 # also count it toward consecutive_failures/health.healthy.
                 provider.mark_quota_exhausted()
                 health.last_error = str(exc)
-                logger.warning("%s external quota exhausted", provider.name)
+                logger.warning("%s quota exhausted", _DISPLAY_NAME[provider.name])
                 return None
             except TransientProviderError as exc:
                 health.record_failure(str(exc))
                 attempt += 1
                 if attempt >= max_attempts or not health.healthy:
                     logger.error(
-                        "%s failed after %d attempt(s): %s", provider.name, attempt, exc
+                        "%s failed after %d attempt(s): %s", _DISPLAY_NAME[provider.name], attempt, exc
                     )
                     return None
                 backoff = min(
@@ -349,7 +394,7 @@ class AIProviderManager:
                 jitter = random.uniform(0, backoff * 0.1)
                 logger.warning(
                     "%s transient failure (attempt %d/%d) — retrying in %.2fs",
-                    provider.name,
+                    _DISPLAY_NAME[provider.name],
                     attempt,
                     max_attempts,
                     backoff + jitter,
@@ -358,7 +403,7 @@ class AIProviderManager:
                 continue
             except FatalProviderError as exc:
                 health.record_failure(str(exc))
-                logger.error("%s failed (non-retryable): %s", provider.name, exc)
+                logger.error("%s failed (non-retryable): %s", _DISPLAY_NAME[provider.name], exc)
                 return None
 
             latency_ms = (time.monotonic() - start) * 1000
@@ -366,84 +411,116 @@ class AIProviderManager:
             if verdict is None:
                 health.record_failure("malformed response")
                 return None
+            was_unhealthy = not health.healthy
             health.record_success(latency_ms)
             provider.record_call()
+            if was_unhealthy:
+                logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
             return verdict
 
     async def get_verdict(
         self, raw_text: str, title: str, price: float, discount_percent: int | None,
         channel_name: str, price_history: float | None,
     ) -> AIVerdict | None:
+        selection_start = time.monotonic()
         user_content = _build_user_content(raw_text, title, price, discount_percent, channel_name, price_history)
 
-        gemini_verdict = await self._try_provider(self.gemini, user_content, is_primary=True)
+        gemini_verdict = await self._try_provider(self.gemini, user_content)
         if gemini_verdict is not None:
-            logger.info(
-                "AI provider: Gemini (latency=%.0fms)", self.health["gemini"].last_latency_ms or 0.0
-            )
+            self.last_provider_used = "gemini"
+            logger.info("AIProviderManager selected Gemini")
+            self._log_selection_time(selection_start)
             return gemini_verdict
 
-        groq_verdict = await self._try_provider(self.groq, user_content, is_primary=False)
+        groq_verdict = await self._try_provider(self.groq, user_content)
         if groq_verdict is not None:
-            logger.info(
-                "AI provider: Groq (Gemini unavailable) (latency=%.0fms)",
-                self.health["groq"].last_latency_ms or 0.0,
-            )
+            self.last_provider_used = "groq"
+            logger.info("AIProviderManager selected Groq (Gemini unavailable)")
+            self._log_selection_time(selection_start)
             return groq_verdict
 
-        logger.info("AI provider: none (both unavailable)")
+        logger.info("AIProviderManager selected none (both providers unavailable)")
+        self._log_selection_time(selection_start)
         return None
 
-    async def _try_provider(self, provider, user_content: str, is_primary: bool) -> AIVerdict | None:
-        if provider.quota_exhausted():
-            logger.info("%s quota exhausted for today — skipping", provider.name)
+    @staticmethod
+    def _log_selection_time(selection_start: float) -> None:
+        elapsed_ms = (time.monotonic() - selection_start) * 1000
+        logger.info("Provider selection completed in %.0f ms", elapsed_ms)
+
+    async def _try_provider(self, provider, user_content: str) -> AIVerdict | None:
+        health = self.health[provider.name]
+        if health.disabled:
+            logger.info("%s disabled (no API key) — skipping", _DISPLAY_NAME[provider.name])
             return None
 
-        health = self.health[provider.name]
+        if provider.quota_exhausted():
+            logger.info("%s quota exhausted for today — skipping", _DISPLAY_NAME[provider.name])
+            return None
+
         can_attempt, is_probe = health.can_attempt()
         if not can_attempt:
-            logger.info("%s in cooldown — skipping", provider.name)
+            logger.info("%s in cooldown — skipping", _DISPLAY_NAME[provider.name])
             return None
 
         if is_probe:
-            logger.info("%s cooldown expired — sending single probe request", provider.name)
-            verdict = await self._attempt(provider, user_content, max_attempts=1)
-            if verdict is not None:
-                logger.info("%s recovered — marked healthy again", provider.name)
-            return verdict
+            logger.info("%s cooldown expired — sending single probe request", _DISPLAY_NAME[provider.name])
+            return await self._attempt(provider, user_content, max_attempts=1)
 
         return await self._attempt(provider, user_content, max_attempts=AI_RETRY_COUNT + 1)
 
     def status_snapshot(self) -> dict:
-        def _label(provider, health: ProviderHealth) -> str:
+        def _status_label(provider, health: ProviderHealth) -> str:
+            if health.disabled:
+                return "DISABLED (missing API key)"
             if provider.quota_exhausted():
                 return "QUOTA EXHAUSTED"
             if not health.healthy and not health.is_probe_ready():
                 return "UNHEALTHY"
-            return "Healthy"
+            return "HEALTHY"
+
+        def _provider_info(provider, health: ProviderHealth) -> dict:
+            cooldown_seconds = health.cooldown_remaining_seconds()
+            return {
+                "status": _status_label(provider, health),
+                "calls_today": provider.calls_today(),
+                "consecutive_failures": health.consecutive_failures,
+                "last_success": health.last_success,
+                "avg_latency_ms": health.avg_latency_ms,
+                "cooldown_remaining_seconds": cooldown_seconds if cooldown_seconds > 0 else None,
+                "quota_available": not provider.quota_exhausted(),
+                "api_key_configured": not health.disabled,
+            }
 
         gemini_health = self.health["gemini"]
         groq_health = self.health["groq"]
-        gemini_usable = not self.gemini.quota_exhausted() and gemini_health.healthy
-        groq_label = "ACTIVE" if (groq_health.healthy and not self.groq.quota_exhausted() and not gemini_usable) else _label(self.groq, groq_health)
+
+        def _usable(provider, health: ProviderHealth) -> bool:
+            can_attempt, _ = health.can_attempt()
+            return can_attempt and not provider.quota_exhausted()
+
+        if _usable(self.gemini, gemini_health):
+            current_provider = "Gemini"
+        elif _usable(self.groq, groq_health):
+            current_provider = "Groq"
+        else:
+            current_provider = "None"
 
         return {
-            "gemini": {
-                "status": _label(self.gemini, gemini_health),
-                "calls_today": self.gemini.calls_today(),
-                "last_latency_ms": gemini_health.last_latency_ms,
-            },
-            "groq": {
-                "status": groq_label,
-                "calls_today": self.groq.calls_today(),
-                "last_latency_ms": groq_health.last_latency_ms,
-            },
-            "primary": "Gemini",
+            "gemini": _provider_info(self.gemini, gemini_health),
+            "groq": _provider_info(self.groq, groq_health),
+            "current_provider": current_provider,
             "fallback": "Groq",
+            "last_provider_used": _DISPLAY_NAME.get(self.last_provider_used, "None"),
         }
 
     def both_quota_exhausted(self) -> bool:
         return self.gemini.quota_exhausted() and self.groq.quota_exhausted()
+
+    def both_unavailable(self) -> bool:
+        gemini_can, _ = self.health["gemini"].can_attempt()
+        groq_can, _ = self.health["groq"].can_attempt()
+        return (not gemini_can or self.gemini.quota_exhausted()) and (not groq_can or self.groq.quota_exhausted())
 
 
 _manager = AIProviderManager(GeminiProvider(), GroqProvider())

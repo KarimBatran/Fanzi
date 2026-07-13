@@ -138,8 +138,23 @@ def format_status_message() -> str:
 
     providers = snapshot["providers"]
 
-    def _latency_line(p: dict) -> str:
-        return f"Last latency: {int(p['last_latency_ms'])} ms" if p["last_latency_ms"] is not None else "Last latency: n/a"
+    def _provider_lines(name: str, p: dict) -> list[str]:
+        latency = f"{int(p['avg_latency_ms'])} ms" if p["avg_latency_ms"] is not None else "n/a"
+        cooldown = (
+            f"{int(p['cooldown_remaining_seconds'] // 60)}m {int(p['cooldown_remaining_seconds'] % 60)}s"
+            if p["cooldown_remaining_seconds"] is not None
+            else "None"
+        )
+        return [
+            name,
+            f"Status: {p['status']}",
+            f"Calls today: {p['calls_today']}",
+            f"Failures: {p['consecutive_failures']}",
+            f"Latency: {latency}",
+            f"Cooldown: {cooldown}",
+            f"Quota: {'Available' if p['quota_available'] else 'EXHAUSTED'}",
+            f"API Key: {'Yes' if p['api_key_configured'] else 'No'}",
+        ]
 
     lines = [
         header,
@@ -154,16 +169,14 @@ def format_status_message() -> str:
         f"{snapshot['active_duplicate_entries']} active duplicate entries",
         "",
         "🧠 AI Providers",
-        "Gemini",
-        f"Status: {providers['gemini']['status']}",
-        f"Calls today: {providers['gemini']['calls_today']}",
-        _latency_line(providers["gemini"]),
-        "Groq",
-        f"Status: {providers['groq']['status']}",
-        f"Calls today: {providers['groq']['calls_today']}",
-        _latency_line(providers["groq"]),
-        f"Current primary: {providers['primary']}",
-        f"Fallback: {providers['fallback']}",
+        *_provider_lines("Gemini", providers["gemini"]),
+        *_provider_lines("Groq", providers["groq"]),
+        "Current provider:",
+        providers["current_provider"],
+        "Fallback:",
+        providers["fallback"],
+        "Last provider used:",
+        providers["last_provider_used"],
     ]
     if delayed:
         lines.append("")

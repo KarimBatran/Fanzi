@@ -260,3 +260,59 @@ async def test_unified_response_schema_identical_across_providers():
         assert verdict.reason
         assert verdict.suggested_target == 4800
         assert verdict.category == "appliance"
+
+
+@pytest.mark.asyncio
+async def test_startup_with_missing_api_key_disables_provider(monkeypatch):
+    monkeypatch.setattr("listener.ai_providers.GROQ_API_KEY", "")
+    manager = _manager()
+
+    assert manager.health["groq"].disabled is True
+    assert manager.status_snapshot()["groq"]["status"] == "DISABLED (missing API key)"
+    assert manager.status_snapshot()["groq"]["api_key_configured"] is False
+
+    # A disabled provider must never be attempted, even as a fallback.
+    with patch.object(
+        manager.gemini, "generate", new=AsyncMock(side_effect=TransientProviderError("down"))
+    ), patch.object(manager.groq, "generate", new=AsyncMock()) as groq_generate, patch(
+        "listener.ai_providers.asyncio.sleep", new=AsyncMock()
+    ):
+        verdict = await _get_verdict(manager)
+
+    groq_generate.assert_not_called()
+    assert verdict is None
+
+
+@pytest.mark.asyncio
+async def test_startup_with_valid_api_keys_marks_both_healthy(monkeypatch):
+    monkeypatch.setattr("listener.ai_providers.GEMINI_API_KEY", "fake-gemini-key")
+    monkeypatch.setattr("listener.ai_providers.GROQ_API_KEY", "fake-groq-key")
+    manager = _manager()
+
+    assert manager.health["gemini"].disabled is False
+    assert manager.health["groq"].disabled is False
+    snapshot = manager.status_snapshot()
+    assert snapshot["gemini"]["api_key_configured"] is True
+    assert snapshot["groq"]["api_key_configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_provider_skipped_without_any_retry_attempt():
+    """Once a provider is in an open circuit breaker (not yet probe-ready),
+    the manager must not call generate() at all — no wasted retries against
+    a provider already known to be unavailable.
+    """
+    manager = _manager()
+    health = manager.health["gemini"]
+    health.healthy = False
+    health.consecutive_failures = 5
+    health.cooldown_until_monotonic = __import__("time").monotonic() + 900  # far in the future
+
+    with patch.object(manager.gemini, "generate", new=AsyncMock()) as gemini_generate, patch.object(
+        manager.groq, "generate", new=AsyncMock(return_value=_VALID_JSON)
+    ):
+        verdict = await _get_verdict(manager)
+
+    gemini_generate.assert_not_called()
+    assert verdict is not None
+    assert verdict.provider == "groq"

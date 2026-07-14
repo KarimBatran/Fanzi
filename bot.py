@@ -558,6 +558,7 @@ async def _post_shutdown(application: Application) -> None:
 
     telethon_client = application.bot_data.get("telethon_client")
     if telethon_client is not None:
+        listener_watcher.stop_reconnect_watcher()
         await telethon_client.disconnect()
         logger.info("deal listener stopped")
 

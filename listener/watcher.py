@@ -47,7 +47,7 @@ from config import (
     TELETHON_API_ID,
     TELETHON_SESSION_NAME,
 )
-from listener import channels_store, dedup, pending_deals
+from listener import channels_store, dedup, pending_deals, replay
 from listener.ai_providers import get_manager
 from listener.analyzer import DealVerdict, analyze_deal, meets_min_quality
 from listener.parser import ParseDiagnostics, ParsedDeal, extract_from_post
@@ -63,6 +63,7 @@ _QUALITY_EMOJI = {"great": "🔥", "good": "✅", "average": "🤷", "skip": "�
 _client: TelegramClient | None = None
 _bot: Bot | None = None
 _message_handler = None
+_reconnect_task: asyncio.Task | None = None
 _watched_channels: list[str] = []
 
 
@@ -117,7 +118,9 @@ def _build_message_for_verdict(deal: ParsedDeal, verdict: DealVerdict | None, cl
     return _format_message(deal, f"{emoji} {verdict.reason}", clean_url)
 
 
-async def _handle_post(bot: Bot, text: str, channel_name: str, message_id: int | None = None) -> None:
+async def _handle_post(
+    bot: Bot, text: str, channel_name: str, message_id: int | None = None, channel_id: int | None = None,
+) -> None:
     logger.info("[%s] Post received: %s", channel_name, text[:50].replace("\n", " "))
     stat_date = date.today().isoformat()
     now = datetime.now()
@@ -133,6 +136,12 @@ async def _handle_post(bot: Bot, text: str, channel_name: str, message_id: int |
         raise
     finally:
         database.record_channel_latency(channel_name, stat_date, timing.total_ms())
+
+    # Only advances the replay checkpoint once processing has completed
+    # without raising — an unexpected exception above must not advance it,
+    # so the next replay retries this same message.
+    if message_id is not None:
+        database.set_channel_replay_state(channel_name, channel_id, message_id, now.isoformat())
 
 
 async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, timing: DealTiming) -> None:
@@ -294,7 +303,7 @@ def _make_message_handler(bot: Bot):
         channel_name = getattr(channel, "username", None) or getattr(channel, "title", "unknown")
         text = event.message.message or ""
         try:
-            await _handle_post(bot, text, channel_name, message_id=event.message.id)
+            await _handle_post(bot, text, channel_name, message_id=event.message.id, channel_id=channel.id)
         except FloodWaitError as exc:
             logger.warning("FloodWaitError — sleeping %ds", exc.seconds)
             await asyncio.sleep(exc.seconds)
@@ -354,8 +363,20 @@ async def start_background_listener(bot: Bot) -> TelegramClient | None:
     active_count = sum(1 for _, ok in statuses if ok)
     health.set_channels_status(active=active_count, configured=len(channels))
 
+    await replay.replay_all(client, bot, channels, _handle_post, reason="startup")
+
+    global _reconnect_task
+    _reconnect_task = asyncio.create_task(replay.watch_for_reconnects(client, bot, channels, _handle_post))
+
     logger.info("deal listener running in background, watching: %s", ", ".join(channels))
     return client
+
+
+def stop_reconnect_watcher() -> None:
+    global _reconnect_task
+    if _reconnect_task is not None:
+        _reconnect_task.cancel()
+        _reconnect_task = None
 
 
 async def _check_channel_statuses(client: TelegramClient, channels: list[str]) -> list[tuple[str, bool]]:

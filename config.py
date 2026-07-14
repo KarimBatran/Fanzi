@@ -89,3 +89,11 @@ REDIRECT_CACHE_TTL_SECONDS = float(os.getenv("REDIRECT_CACHE_TTL_SECONDS", "300"
 # Channel health watchdog (listener/watchdog.py) — how often the scheduler
 # proactively checks every monitored channel's posting activity.
 CHANNEL_WATCHDOG_INTERVAL_MINUTES = int(os.getenv("CHANNEL_WATCHDOG_INTERVAL_MINUTES", "15"))
+
+# Automatic message replay (listener/replay.py) — recovers deals missed
+# during downtime/disconnects by fetching recent channel history and
+# replaying anything newer than the last successfully processed message ID.
+REPLAY_FETCH_LIMIT = int(os.getenv("REPLAY_FETCH_LIMIT", "50"))
+# How often the reconnect watcher polls the Telethon client's connection
+# state to detect a disconnect -> reconnect transition.
+REPLAY_RECONNECT_POLL_SECONDS = float(os.getenv("REPLAY_RECONNECT_POLL_SECONDS", "10"))

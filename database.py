@@ -194,6 +194,26 @@ CREATE TABLE IF NOT EXISTS channel_last_post (
     last_post_at TEXT NOT NULL,
     last_post_id INTEGER
 );
+
+-- Per-channel replay checkpoint (listener/replay.py) -- the highest Telegram
+-- message ID successfully processed through the normal pipeline (live or
+-- replayed). Updated only on success; never regresses (see
+-- set_channel_replay_state's MAX()), so a slow live message racing an
+-- in-progress replay can't un-advance the checkpoint.
+CREATE TABLE IF NOT EXISTS channel_replay_state (
+    channel TEXT PRIMARY KEY,
+    channel_id INTEGER,
+    last_message_id INTEGER NOT NULL,
+    last_processed_at TEXT NOT NULL
+);
+
+-- Per-day count of messages recovered via replay (startup or reconnect),
+-- for /status -- separate from channel_stats' posts_received, which counts
+-- live *and* replayed posts together.
+CREATE TABLE IF NOT EXISTS replay_stats (
+    stat_date TEXT PRIMARY KEY,
+    recovered_count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -937,6 +957,56 @@ def record_channel_last_post(channel: str, posted_at: str, post_id: int | None) 
             """,
             (channel, posted_at, post_id),
         )
+
+
+def get_channel_replay_state(channel: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM channel_replay_state WHERE channel = ?", (channel,)
+        ).fetchone()
+
+
+def set_channel_replay_state(
+    channel: str, channel_id: int | None, last_message_id: int, last_processed_at: str
+) -> None:
+    """Only ever advances last_message_id (MAX with whatever's already
+    stored) -- a slower live message for an older ID racing an in-progress
+    replay for a newer one (or vice versa) can never regress the checkpoint.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_replay_state (channel, channel_id, last_message_id, last_processed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET
+                channel_id = COALESCE(excluded.channel_id, channel_replay_state.channel_id),
+                last_message_id = MAX(excluded.last_message_id, channel_replay_state.last_message_id),
+                last_processed_at = CASE
+                    WHEN excluded.last_message_id >= channel_replay_state.last_message_id
+                    THEN excluded.last_processed_at ELSE channel_replay_state.last_processed_at
+                END
+            """,
+            (channel, channel_id, last_message_id, last_processed_at),
+        )
+
+
+def record_replay_recovered(stat_date: str, count: int = 1) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO replay_stats (stat_date, recovered_count) VALUES (?, ?)
+            ON CONFLICT(stat_date) DO UPDATE SET recovered_count = recovered_count + excluded.recovered_count
+            """,
+            (stat_date, count),
+        )
+
+
+def get_replay_recovered(stat_date: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT recovered_count FROM replay_stats WHERE stat_date = ?", (stat_date,)
+        ).fetchone()
+    return row["recovered_count"] if row else 0
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

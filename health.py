@@ -13,7 +13,7 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
-from listener import channels_store, dedup, learning, watchdog
+from listener import channels_store, dedup, learning, replay, watchdog
 from listener.ai_providers import get_manager
 
 # A channel showing this many combined parse failures (no price/no ASIN/
@@ -145,6 +145,7 @@ def build_snapshot() -> dict:
         "providers": providers,
         "learning": learning_snapshot,
         "channel_health": get_channel_health(),
+        "replay": replay.get_status(),
         "pid": os.getpid(),
     }
 
@@ -261,6 +262,14 @@ def format_status_message() -> str:
         "",
         "📡 Channels",
         *_format_channel_health(snapshot["channel_health"]),
+        "",
+        "Replay",
+        "Last replay:",
+        _timestamp(snapshot["replay"]["last_replay_at"]),
+        "Recovered messages today:",
+        str(snapshot["replay"]["recovered_today"]),
+        "Replay state:",
+        snapshot["replay"]["state"].capitalize(),
     ]
     if delayed:
         lines.append("")

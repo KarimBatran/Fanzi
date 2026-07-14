@@ -128,7 +128,16 @@ class AIVerdict:
 
 def _parse_verdict(text: str, provider: str) -> AIVerdict | None:
     try:
-        data = json.loads(_strip_json_fence(text))
+        # Use raw_decode (parse one complete top-level value, ignore
+        # anything after it) instead of loads (which demands the *entire*
+        # string be valid JSON). Real Gemini responses have been observed to
+        # occasionally emit one well-formed JSON object followed by a stray
+        # trailing "}" ("Extra data" — recoverable here); a similar-looking
+        # but genuinely corrupted response (a stray character *inside* the
+        # object, before it closes) still fails exactly as before, since
+        # raw_decode can't parse past that point either — this only widens
+        # tolerance for trailing garbage, never accepts truncated/broken JSON.
+        data, _ = json.JSONDecoder().raw_decode(_strip_json_fence(text))
         return AIVerdict(
             provider=provider,
             deal_quality=str(data["deal_quality"]).strip().lower(),

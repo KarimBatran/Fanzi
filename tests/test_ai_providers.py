@@ -20,6 +20,7 @@ from listener.ai_providers import (
     GroqProvider,
     QuotaExhaustedError,
     TransientProviderError,
+    _parse_verdict,
 )
 
 _VALID_JSON = (
@@ -261,6 +262,46 @@ async def test_unified_response_schema_identical_across_providers():
         assert verdict.reason
         assert verdict.suggested_target == 4800
         assert verdict.category == "appliance"
+
+
+def test_parse_verdict_tolerates_trailing_extra_brace():
+    """Real production case: Gemini emitted one complete, valid JSON object
+    followed by a stray extra "}" ("Extra data" JSONDecodeError under
+    json.loads). raw_decode recovers the real verdict instead of discarding
+    it as malformed.
+    """
+    text = (
+        "{\n"
+        '  "deal_quality": "good",\n'
+        '  "reason": "Strong 41% discount on a reliable TP-Link PoE switch, offering great value.",\n'
+        '  "suggested_target": 745,\n'
+        '  "category": "accessory"\n'
+        "}\n"
+        "}"
+    )
+    verdict = _parse_verdict(text, "gemini")
+    assert verdict is not None
+    assert verdict.deal_quality == "good"
+    assert verdict.suggested_target == 745
+    assert verdict.category == "accessory"
+
+
+def test_parse_verdict_still_rejects_genuine_mid_object_corruption():
+    """Real production case: a stray quote landed *inside* the object,
+    before it closed ("Expecting ',' delimiter"). This is genuine
+    corruption, not trailing garbage — must still be rejected, not guessed at.
+    """
+    text = (
+        "{\n"
+        '  "deal_quality": "good",\n'
+        '  "reason": "A solid 28% discount on a reliable Kenwood appliance with high utility.",\n'
+        '  "suggested_target": 1850,\n'
+        '  "category": "appliance"\n'
+        '"\n'
+        "}"
+    )
+    verdict = _parse_verdict(text, "gemini")
+    assert verdict is None
 
 
 @pytest.mark.asyncio

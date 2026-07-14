@@ -101,7 +101,19 @@ class ParsedDeal:
     redirect_ms: float = 0.0
 
 
-async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | None:
+@dataclass
+class ParseDiagnostics:
+    """Optional out-parameter for extract_from_post — set only when it
+    returns None, so callers (listener/watcher.py) can distinguish *why* for
+    per-channel health metrics without extract_from_post's return type
+    changing for existing callers/tests.
+    """
+    reason: str | None = None  # "no_asin" | "non_amazon_link" | "no_price"
+
+
+async def extract_from_post(
+    text: str, channel_name: str = "", *, diagnostics: ParseDiagnostics | None = None
+) -> ParsedDeal | None:
     """Returns a ParsedDeal, or None if no valid Amazon.eg ASIN / price found."""
     if not text:
         return None
@@ -132,10 +144,17 @@ async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | N
             asin = text_match.group(0)
 
     if asin is None:
+        if diagnostics is not None:
+            # Links were present but none resolved to a usable Amazon ASIN
+            # (a different site, a dead shortener, ...) vs. no link/bare-ASIN
+            # pattern in the post at all.
+            diagnostics.reason = "non_amazon_link" if urls else "no_asin"
         return None
 
     price = _extract_price(normalized)
     if price is None:
+        if diagnostics is not None:
+            diagnostics.reason = "no_price"
         return None
 
     return ParsedDeal(

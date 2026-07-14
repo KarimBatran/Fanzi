@@ -13,8 +13,13 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
-from listener import dedup, learning
+from listener import channels_store, dedup, learning, watchdog
 from listener.ai_providers import get_manager
+
+# A channel showing this many combined parse failures (no price/no ASIN/
+# non-Amazon link) today is flagged even if it's still posting normally —
+# distinct from the watchdog's silence-based anomaly.
+_PARSER_FAILURE_WARNING_THRESHOLD = 5
 
 HEALTH_FILE_PATH = "health.json"
 
@@ -84,6 +89,38 @@ def _is_delayed() -> bool:
     return (datetime.now() - _last_check).total_seconds() > threshold_seconds
 
 
+def get_channel_health() -> list[dict]:
+    """Per-channel health for /status and the Phase 1 audit table — built
+    entirely from real persisted counters (database.channel_stats /
+    channel_last_post), never estimated.
+    """
+    stat_date = date.today().isoformat()
+    results = []
+    for channel in channels_store.get_effective_channels():
+        stats = database.get_channel_stats(channel, stat_date)
+        wd = watchdog.check_channel(channel)
+        results.append(
+            {
+                "channel": channel,
+                "posts": stats["posts_received"],
+                "parsed": stats["parsed"],
+                "forwarded": stats["forwarded"],
+                "duplicates": stats["duplicates"],
+                "ai_analyses": stats["ai_analyses"],
+                "rule_hits": stats["rule_hits"],
+                "no_price_failures": stats["no_price_failures"],
+                "no_asin_failures": stats["no_asin_failures"],
+                "non_amazon_links": stats["non_amazon_links"],
+                "total_failures": stats["total_failures"],
+                "last_post_at": wd.last_post_at,
+                "minutes_since_last_post": wd.minutes_since_last_post,
+                "is_silent_anomaly": wd.is_silent_anomaly,
+                "warning": wd.warning,
+            }
+        )
+    return results
+
+
 def build_snapshot() -> dict:
     """Full snapshot used by both /status and health.json."""
     _reset_counters_if_new_day()
@@ -107,6 +144,7 @@ def build_snapshot() -> dict:
         "active_duplicate_entries": dedup.get_active_count(),
         "providers": providers,
         "learning": learning_snapshot,
+        "channel_health": get_channel_health(),
         "pid": os.getpid(),
     }
 
@@ -125,6 +163,28 @@ def write_health_file() -> None:
     }
     with open(HEALTH_FILE_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+
+def _format_channel_health(channel_health: list[dict]) -> list[str]:
+    if not channel_health:
+        return ["(no channels configured)"]
+
+    lines: list[str] = []
+    for ch in channel_health:
+        lines.append(ch["channel"])
+        parser_failures_total = ch["no_price_failures"] + ch["no_asin_failures"] + ch["non_amazon_links"]
+        if ch["is_silent_anomaly"]:
+            lines.append(f"⚠ {ch['warning']}")
+            continue
+        if parser_failures_total >= _PARSER_FAILURE_WARNING_THRESHOLD:
+            lines.append(f"⚠ Parser failures: {parser_failures_total} today")
+        else:
+            lines.append("✅ Healthy")
+        lines.append(f"Posts: {ch['posts']}")
+        lines.append(f"Forwarded: {ch['forwarded']}")
+        if ch["minutes_since_last_post"] is not None:
+            lines.append(f"Last post: {int(ch['minutes_since_last_post'])} min ago")
+    return lines
 
 
 def format_status_message() -> str:
@@ -198,6 +258,9 @@ def format_status_message() -> str:
         f"🎯 AI calls saved today: {learning_snapshot['ai_calls_saved_today']}",
         f"Learning confidence average: {learning_snapshot['avg_confidence']:.0%}",
         f"Knowledge base version: {learning_snapshot['kb_version']}",
+        "",
+        "📡 Channels",
+        *_format_channel_health(snapshot["channel_health"]),
     ]
     if delayed:
         lines.append("")

@@ -13,8 +13,8 @@ from telegram import Bot
 import database
 import health
 from amazon.tracker import ProductFetchError, fetch_product, format_price
-from config import ADMIN_TELEGRAM_ID, CHECK_INTERVAL_MINUTES
-from listener import dedup
+from config import ADMIN_TELEGRAM_ID, CHANNEL_WATCHDOG_INTERVAL_MINUTES, CHECK_INTERVAL_MINUTES
+from listener import channels_store, dedup, watchdog
 from models.tracked_product import TrackedProduct
 
 _CAIRO_TZ = ZoneInfo("Africa/Cairo")
@@ -83,6 +83,17 @@ async def _send_alert(
         )
 
 
+async def run_channel_watchdog() -> None:
+    """Proactively checks every monitored channel's posting activity against
+    its own historical average and logs a WARNING for any anomaly — so a
+    silently-dead channel subscription surfaces without anyone having to
+    ask for /status first.
+    """
+    channels = channels_store.get_effective_channels()
+    if channels:
+        watchdog.check_all_channels(channels)
+
+
 async def send_daily_heartbeat(bot: Bot) -> None:
     """Sends the same snapshot /status shows, once a day, so the admin knows
     the bot is alive without having to ask.
@@ -109,5 +120,11 @@ def build_scheduler(bot: Bot) -> AsyncIOScheduler:
         CronTrigger(hour=9, minute=0, timezone=_CAIRO_TZ),
         args=[bot],
         id="daily_heartbeat",
+    )
+    scheduler.add_job(
+        run_channel_watchdog,
+        "interval",
+        minutes=CHANNEL_WATCHDOG_INTERVAL_MINUTES,
+        id="channel_watchdog",
     )
     return scheduler

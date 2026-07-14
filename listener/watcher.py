@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import time
+from datetime import date, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 # Same embeddable-Python sys.path workaround as bot.py (see the comment
@@ -49,7 +50,7 @@ from config import (
 from listener import channels_store, dedup, pending_deals
 from listener.ai_providers import get_manager
 from listener.analyzer import DealVerdict, analyze_deal, meets_min_quality
-from listener.parser import ParsedDeal, extract_from_post
+from listener.parser import ParseDiagnostics, ParsedDeal, extract_from_post
 from listener.timing import DealTiming
 
 logger = logging.getLogger("fanzi.listener.watcher")
@@ -116,16 +117,39 @@ def _build_message_for_verdict(deal: ParsedDeal, verdict: DealVerdict | None, cl
     return _format_message(deal, f"{emoji} {verdict.reason}", clean_url)
 
 
-async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
+async def _handle_post(bot: Bot, text: str, channel_name: str, message_id: int | None = None) -> None:
     logger.info("[%s] Post received: %s", channel_name, text[:50].replace("\n", " "))
+    stat_date = date.today().isoformat()
+    now = datetime.now()
+    database.record_channel_post_received(channel_name, stat_date)
+    database.record_channel_last_post(channel_name, now.isoformat(), message_id)
+
     timing = DealTiming(channel=channel_name)
 
+    try:
+        await _process_post(bot, text, channel_name, stat_date, timing)
+    except Exception:
+        database.record_channel_failure(channel_name, stat_date)
+        raise
+    finally:
+        database.record_channel_latency(channel_name, stat_date, timing.total_ms())
+
+
+async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, timing: DealTiming) -> None:
+    diagnostics = ParseDiagnostics()
     parse_start = time.perf_counter()
-    deal = await extract_from_post(text, channel_name)
+    deal = await extract_from_post(text, channel_name, diagnostics=diagnostics)
     timing.record("parser", (time.perf_counter() - parse_start) * 1000)
     if deal is None:
+        if diagnostics.reason == "no_price":
+            database.record_channel_no_price(channel_name, stat_date)
+        elif diagnostics.reason == "non_amazon_link":
+            database.record_channel_non_amazon_link(channel_name, stat_date)
+        else:
+            database.record_channel_no_asin(channel_name, stat_date)
         logger.info("[%s] No ASIN found — skipping", channel_name)
         return
+    database.record_channel_parsed(channel_name, stat_date)
     timing.asin = deal.asin
     timing.title = deal.title
     if deal.redirect_ms:
@@ -138,6 +162,7 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
         timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
         logger.info("[%s] duplicate deal skipped", channel_name)
         health.record_duplicate_skipped()
+        database.record_channel_duplicate(channel_name, stat_date)
         return
     if dedup_outcome == dedup.PRICE_CHANGED:
         logger.info("[%s] price changed — reprocessing", channel_name)
@@ -153,7 +178,7 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
 
     if not AI_SOFT_TIMEOUT_ENABLED:
         verdict = await analyze_deal(deal, price_history, timing=timing)
-        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing)
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date)
         return
 
     analysis_task = asyncio.create_task(analyze_deal(deal, price_history, timing=timing))
@@ -161,7 +186,7 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
 
     if analysis_task in done:
         verdict = analysis_task.result()
-        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing)
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date)
         return
 
     # AI hasn't answered within the soft timeout — user experience over
@@ -182,13 +207,21 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
 
     asyncio.create_task(
         _finish_analysis_in_background(
-            bot, analysis_task, deal, clean_url, channel_name, message.chat_id, message.message_id
+            bot, analysis_task, deal, clean_url, channel_name, stat_date, message.chat_id, message.message_id
         )
     )
 
 
+def _record_verdict_stats(verdict: DealVerdict, channel_name: str, stat_date: str) -> None:
+    if verdict.provider == "learned":
+        database.record_channel_rule_hit(channel_name, stat_date)
+    elif verdict.provider in ("gemini", "groq"):
+        database.record_channel_ai_analysis(channel_name, stat_date)
+
+
 async def _forward_verdict(
-    bot: Bot, deal: ParsedDeal, verdict: DealVerdict | None, clean_url: str, channel_name: str, timing: DealTiming,
+    bot: Bot, deal: ParsedDeal, verdict: DealVerdict | None, clean_url: str, channel_name: str,
+    timing: DealTiming, stat_date: str,
 ) -> None:
     """Shared by both the normal (AI answered in time) and soft-timeout
     (AI answered late, called from the immediate path when it happens to
@@ -201,6 +234,7 @@ async def _forward_verdict(
             "[%s] AI verdict (%s): %s — %s", channel_name, verdict.provider, verdict.deal_quality, verdict.reason
         )
         health.record_deal_analyzed()
+        _record_verdict_stats(verdict, channel_name, stat_date)
         if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
             logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
             timing.log_summary()
@@ -210,12 +244,15 @@ async def _forward_verdict(
     send_start = time.perf_counter()
     await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message_text, reply_markup=_track_button(deal.asin))
     timing.record("telegram_send", (time.perf_counter() - send_start) * 1000)
+    database.record_channel_forwarded(channel_name, stat_date)
+    if timing.ai_total_ms():
+        database.record_channel_ai_latency(channel_name, stat_date, timing.ai_total_ms())
     logger.info("[%s] Forwarding to admin", channel_name)
     timing.log_summary()
 
 
 async def _finish_analysis_in_background(
-    bot: Bot, analysis_task: asyncio.Task, deal: ParsedDeal, clean_url: str, channel_name: str,
+    bot: Bot, analysis_task: asyncio.Task, deal: ParsedDeal, clean_url: str, channel_name: str, stat_date: str,
     chat_id: int, message_id: int,
 ) -> None:
     """Awaits the AI analysis that outran the soft timeout, then edits the
@@ -227,6 +264,7 @@ async def _finish_analysis_in_background(
         verdict = await analysis_task
     except Exception:
         logger.exception("[%s] background analysis failed for %s — leaving message unchanged", channel_name, deal.asin)
+        database.record_channel_failure(channel_name, stat_date)
         return
 
     if verdict is None:
@@ -236,12 +274,18 @@ async def _finish_analysis_in_background(
         return
 
     health.record_deal_analyzed()
+    _record_verdict_stats(verdict, channel_name, stat_date)
+    # Already forwarded via the placeholder — the deal is visible either way,
+    # so a low-quality verdict still gets an honest edit rather than leaving
+    # "analyzing..." stuck forever (that's reserved for the AI-failed case).
     new_text = _build_message_for_verdict(deal, verdict, clean_url)
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
+        database.record_channel_forwarded(channel_name, stat_date)
         logger.info("[%s] Edited placeholder with delayed verdict (%s) for %s", channel_name, verdict.provider, deal.asin)
     except Exception:
         logger.exception("[%s] failed to edit placeholder message for %s", channel_name, deal.asin)
+        database.record_channel_failure(channel_name, stat_date)
 
 
 def _make_message_handler(bot: Bot):
@@ -250,7 +294,7 @@ def _make_message_handler(bot: Bot):
         channel_name = getattr(channel, "username", None) or getattr(channel, "title", "unknown")
         text = event.message.message or ""
         try:
-            await _handle_post(bot, text, channel_name)
+            await _handle_post(bot, text, channel_name, message_id=event.message.id)
         except FloodWaitError as exc:
             logger.warning("FloodWaitError — sleeping %ds", exc.seconds)
             await asyncio.sleep(exc.seconds)
@@ -319,8 +363,12 @@ async def _check_channel_statuses(client: TelegramClient, channels: list[str]) -
     results: list[tuple[str, bool]] = []
     for channel in channels:
         try:
-            await client.get_entity(channel)
-            logger.info("deal listener joined channel: %s", channel)
+            entity = await client.get_entity(channel)
+            # Logs the resolved Telegram entity ID alongside the configured
+            # name — makes "Got difference for channel <id>" telethon log
+            # lines attributable to a specific monitored channel without
+            # guessing, which matters for auditing per-channel health.
+            logger.info("deal listener joined channel: %s (id=%s)", channel, entity.id)
             results.append((channel, True))
         except Exception:
             logger.warning("deal listener could not resolve channel: %s", channel)

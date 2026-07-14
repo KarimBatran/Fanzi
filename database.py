@@ -161,6 +161,39 @@ CREATE TABLE IF NOT EXISTS learning_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Per-channel, per-day pipeline counters (listener/watcher.py) — survives
+-- restarts like provider_stats/learning_stats. posts_received is bumped for
+-- every single incoming post regardless of outcome, so it's the true
+-- "is Telegram delivering updates for this channel at all" signal,
+-- independent of whether anything downstream ever parses/forwards.
+CREATE TABLE IF NOT EXISTS channel_stats (
+    channel TEXT NOT NULL,
+    stat_date TEXT NOT NULL,
+    posts_received INTEGER NOT NULL DEFAULT 0,
+    parsed INTEGER NOT NULL DEFAULT 0,
+    forwarded INTEGER NOT NULL DEFAULT 0,
+    duplicates INTEGER NOT NULL DEFAULT 0,
+    no_price_failures INTEGER NOT NULL DEFAULT 0,
+    no_asin_failures INTEGER NOT NULL DEFAULT 0,
+    non_amazon_links INTEGER NOT NULL DEFAULT 0,
+    ai_analyses INTEGER NOT NULL DEFAULT 0,
+    rule_hits INTEGER NOT NULL DEFAULT 0,
+    total_failures INTEGER NOT NULL DEFAULT 0,
+    total_latency_ms REAL NOT NULL DEFAULT 0,
+    latency_count INTEGER NOT NULL DEFAULT 0,
+    total_ai_latency_ms REAL NOT NULL DEFAULT 0,
+    ai_latency_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (channel, stat_date)
+);
+
+-- Current (not date-scoped) last-post state per channel, for /status and the
+-- watchdog — updated on every post received, regardless of outcome.
+CREATE TABLE IF NOT EXISTS channel_last_post (
+    channel TEXT PRIMARY KEY,
+    last_post_at TEXT NOT NULL,
+    last_post_id INTEGER
+);
 """
 
 
@@ -778,6 +811,132 @@ def get_learning_stats(stat_date: str) -> dict:
         "validation_agreements": row["validation_agreements"],
         "validation_disagreements": row["validation_disagreements"],
     }
+
+
+_CHANNEL_STAT_COLUMNS = (
+    "posts_received",
+    "parsed",
+    "forwarded",
+    "duplicates",
+    "no_price_failures",
+    "no_asin_failures",
+    "non_amazon_links",
+    "ai_analyses",
+    "rule_hits",
+    "total_failures",
+)
+
+
+def _bump_channel_stat(channel: str, stat_date: str, column: str, delta: float = 1) -> None:
+    assert column in _CHANNEL_STAT_COLUMNS + ("total_latency_ms", "latency_count", "total_ai_latency_ms", "ai_latency_count")
+    with get_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO channel_stats (channel, stat_date, {column}) VALUES (?, ?, ?)
+            ON CONFLICT(channel, stat_date) DO UPDATE SET {column} = {column} + excluded.{column}
+            """,
+            (channel, stat_date, delta),
+        )
+
+
+def record_channel_post_received(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "posts_received")
+
+
+def record_channel_parsed(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "parsed")
+
+
+def record_channel_forwarded(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "forwarded")
+
+
+def record_channel_duplicate(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "duplicates")
+
+
+def record_channel_no_price(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "no_price_failures")
+
+
+def record_channel_no_asin(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "no_asin_failures")
+
+
+def record_channel_non_amazon_link(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "non_amazon_links")
+
+
+def record_channel_ai_analysis(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "ai_analyses")
+
+
+def record_channel_rule_hit(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "rule_hits")
+
+
+def record_channel_failure(channel: str, stat_date: str) -> None:
+    _bump_channel_stat(channel, stat_date, "total_failures")
+
+
+def record_channel_latency(channel: str, stat_date: str, latency_ms: float) -> None:
+    _bump_channel_stat(channel, stat_date, "total_latency_ms", latency_ms)
+    _bump_channel_stat(channel, stat_date, "latency_count", 1)
+
+
+def record_channel_ai_latency(channel: str, stat_date: str, latency_ms: float) -> None:
+    _bump_channel_stat(channel, stat_date, "total_ai_latency_ms", latency_ms)
+    _bump_channel_stat(channel, stat_date, "ai_latency_count", 1)
+
+
+def get_channel_stats(channel: str, stat_date: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM channel_stats WHERE channel = ? AND stat_date = ?", (channel, stat_date)
+        ).fetchone()
+    if row is None:
+        return {col: 0 for col in _CHANNEL_STAT_COLUMNS} | {
+            "total_latency_ms": 0.0, "latency_count": 0, "total_ai_latency_ms": 0.0, "ai_latency_count": 0,
+        }
+    return {col: row[col] for col in _CHANNEL_STAT_COLUMNS} | {
+        "total_latency_ms": row["total_latency_ms"],
+        "latency_count": row["latency_count"],
+        "total_ai_latency_ms": row["total_ai_latency_ms"],
+        "ai_latency_count": row["ai_latency_count"],
+    }
+
+
+def get_channel_stats_range(channel: str, start_date: str, end_date: str) -> dict:
+    """Summed counters for `channel` over [start_date, end_date] inclusive —
+    used by the watchdog to compute a 7-day average posting frequency.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(posts_received), 0) AS posts_received
+            FROM channel_stats WHERE channel = ? AND stat_date BETWEEN ? AND ?
+            """,
+            (channel, start_date, end_date),
+        ).fetchone()
+    return {"posts_received": row["posts_received"]}
+
+
+def get_channel_last_post(channel: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM channel_last_post WHERE channel = ?", (channel,)
+        ).fetchone()
+
+
+def record_channel_last_post(channel: str, posted_at: str, post_id: int | None) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_last_post (channel, last_post_at, last_post_id) VALUES (?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET last_post_at = excluded.last_post_at, last_post_id = excluded.last_post_id
+            """,
+            (channel, posted_at, post_id),
+        )
 
 
 def _row_to_user(row: sqlite3.Row) -> User:

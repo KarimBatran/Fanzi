@@ -85,3 +85,7 @@ AI_SOFT_TIMEOUT_SECONDS = float(os.getenv("AI_SOFT_TIMEOUT_SECONDS", "2.5"))
 # across channels within minutes; caching avoids a redundant network
 # round-trip for an identical URL seen again inside the TTL window.
 REDIRECT_CACHE_TTL_SECONDS = float(os.getenv("REDIRECT_CACHE_TTL_SECONDS", "300"))
+
+# Channel health watchdog (listener/watchdog.py) — how often the scheduler
+# proactively checks every monitored channel's posting activity.
+CHANNEL_WATCHDOG_INTERVAL_MINUTES = int(os.getenv("CHANNEL_WATCHDOG_INTERVAL_MINUTES", "15"))

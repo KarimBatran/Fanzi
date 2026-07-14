@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- current_price doubles as "last seen price" (updated on every check cycle
+-- regardless of whether a notification fires); last_checked doubles as
+-- "last checked at". last_notified_price is shared by both the general
+-- price-change notifier and the target-reached alert (see scheduler.py) --
+-- both only ever set it to the price they just notified about, so it always
+-- reflects "the price of the most recent notification of any kind".
+-- available tracks the price-change state machine's third dimension
+-- (in stock / unavailable) alongside price.
 CREATE TABLE IF NOT EXISTS tracked_products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id),
@@ -32,6 +40,7 @@ CREATE TABLE IF NOT EXISTS tracked_products (
     last_checked TEXT,
     last_notified_price REAL,
     active INTEGER NOT NULL DEFAULT 1,
+    available INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -262,6 +271,18 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+        # Migration for DBs created before per-product availability tracking
+        # existed (see scheduler.py's price-change state machine). Existing
+        # rows default to available=1 (in stock) -- this does NOT itself
+        # trigger a notification; the next check cycle simply compares
+        # against it like any other state, and current_price already holds
+        # each product's last-seen price from every prior check, so no
+        # separate backfill is needed for that half of the migration.
+        try:
+            conn.execute("ALTER TABLE tracked_products ADD COLUMN available INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
 
 def get_or_create_user(telegram_id: int, username: str | None) -> User:
     with get_connection() as conn:
@@ -351,11 +372,11 @@ def get_all_active_products_with_owner() -> list[tuple[TrackedProduct, int]]:
         return [(_row_to_product(row), row["owner_telegram_id"]) for row in rows]
 
 
-def update_price_check(product_id: int, current_price: float) -> None:
+def update_price_check(product_id: int, current_price: float | None, available: bool = True) -> None:
     with get_connection() as conn:
         conn.execute(
-            "UPDATE tracked_products SET current_price = ?, last_checked = datetime('now') WHERE id = ?",
-            (current_price, product_id),
+            "UPDATE tracked_products SET current_price = ?, available = ?, last_checked = datetime('now') WHERE id = ?",
+            (current_price, 1 if available else 0, product_id),
         )
 
 
@@ -1098,5 +1119,6 @@ def _row_to_product(row: sqlite3.Row) -> TrackedProduct:
         last_checked=row["last_checked"],
         last_notified_price=row["last_notified_price"],
         active=bool(row["active"]),
+        available=bool(row["available"]),
         created_at=row["created_at"],
     )

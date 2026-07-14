@@ -16,4 +16,5 @@ class TrackedProduct:
     last_checked: str | None
     last_notified_price: float | None
     active: bool
+    available: bool
     created_at: str

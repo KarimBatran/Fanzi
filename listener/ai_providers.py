@@ -75,7 +75,16 @@ _SYSTEM_PROMPT = (
     "are average."
 )
 
+_STRICT_SYSTEM_PROMPT = (
+    _SYSTEM_PROMPT
+    + " Respond with valid JSON only. No Markdown code fences. No explanations. "
+    "No additional text before or after the JSON object. Return only the exact "
+    "schema requested above."
+)
+
 _JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+_REQUIRED_VERDICT_FIELDS = ("deal_quality", "reason", "suggested_target", "category")
 
 _DISPLAY_NAME = {"gemini": "Gemini", "groq": "Groq"}
 
@@ -126,28 +135,92 @@ class AIVerdict:
     category: str
 
 
-def _parse_verdict(text: str, provider: str) -> AIVerdict | None:
+@dataclass
+class _ParseResult:
+    verdict: AIVerdict | None
+    recovery_log: str | None  # set when parsing only succeeded via a resilience mechanism
+    failure_reason: str | None  # set when parsing/schema validation failed
+
+
+def _extract_json_object(text: str) -> tuple[dict | None, bool, bool, bool]:
+    """Locates and decodes one JSON object inside `text`, tolerating common
+    LLM formatting mistakes. Returns
+    (data_or_None, was_markdown_fenced, had_leading_prose, had_trailing_text).
+    Does not validate the verdict schema — that's _classify_and_parse's job.
+
+    Resilience, in order applied:
+    1. Markdown code fences (```/```json ... ```) are stripped.
+    2. Any leading explanatory prose before the first "{" is skipped.
+    3. raw_decode parses exactly one complete top-level JSON value and
+       ignores anything after it (trailing prose, a stray extra "}", etc.)
+       — this is what recovers the real "Extra data" production case.
+
+    Genuine corruption *inside* the object (a stray character before it
+    closes) still fails here exactly as before: raw_decode can't parse past
+    that point, so there's nothing safe to recover — this only widens what
+    counts as "surrounding noise" versus "the object itself".
+    """
+    was_fenced = _JSON_FENCE_RE.search(text) is not None
+    stripped = _strip_json_fence(text)
+    start = stripped.find("{")
+    if start == -1:
+        return None, was_fenced, False, False
+
+    had_leading_prose = stripped[:start].strip() != ""
+    candidate = stripped[start:]
     try:
-        # Use raw_decode (parse one complete top-level value, ignore
-        # anything after it) instead of loads (which demands the *entire*
-        # string be valid JSON). Real Gemini responses have been observed to
-        # occasionally emit one well-formed JSON object followed by a stray
-        # trailing "}" ("Extra data" — recoverable here); a similar-looking
-        # but genuinely corrupted response (a stray character *inside* the
-        # object, before it closes) still fails exactly as before, since
-        # raw_decode can't parse past that point either — this only widens
-        # tolerance for trailing garbage, never accepts truncated/broken JSON.
-        data, _ = json.JSONDecoder().raw_decode(_strip_json_fence(text))
-        return AIVerdict(
+        data, end_index = json.JSONDecoder().raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None, was_fenced, had_leading_prose, False
+
+    had_trailing_text = candidate[end_index:].strip() != ""
+    return data, was_fenced, had_leading_prose, had_trailing_text
+
+
+def _classify_and_parse(text: str, provider: str) -> _ParseResult:
+    data, was_fenced, had_leading_prose, had_trailing_text = _extract_json_object(text)
+
+    if data is None:
+        return _ParseResult(None, None, "AI response was not valid JSON")
+
+    missing = [f for f in _REQUIRED_VERDICT_FIELDS if f not in data]
+    if missing:
+        return _ParseResult(
+            None, None, f"AI response schema invalid (missing {', '.join(missing)})"
+        )
+
+    try:
+        verdict = AIVerdict(
             provider=provider,
             deal_quality=str(data["deal_quality"]).strip().lower(),
             reason=str(data["reason"]).strip(),
             suggested_target=int(float(data["suggested_target"])),
             category=str(data["category"]).strip().lower(),
         )
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.exception("malformed %s analysis response: %s", provider, text)
-        return None
+    except (TypeError, ValueError):
+        return _ParseResult(None, None, "AI response had an invalid field value")
+
+    recovery_log = None
+    if was_fenced:
+        recovery_log = "AI response wrapped in Markdown — recovered"
+    elif had_leading_prose and had_trailing_text:
+        recovery_log = "AI response contained surrounding text — recovered"
+    elif had_leading_prose:
+        recovery_log = "AI response contained leading text — recovered"
+    elif had_trailing_text:
+        recovery_log = "AI response contained trailing characters — recovered"
+
+    return _ParseResult(verdict, recovery_log, None)
+
+
+def _parse_verdict(text: str, provider: str) -> AIVerdict | None:
+    """Thin verdict-or-None wrapper over _classify_and_parse, for callers
+    that don't need the repair-retry orchestration in AIProviderManager._attempt.
+    """
+    result = _classify_and_parse(text, provider)
+    if result.verdict is None:
+        logger.error("malformed %s analysis response (%s): %s", provider, result.failure_reason, text)
+    return result.verdict
 
 
 def _build_user_content(raw_text: str, title: str, price: float, discount_percent: int | None, channel_name: str, price_history: float | None) -> str:
@@ -191,14 +264,14 @@ class GeminiProvider:
     def record_call(self) -> None:
         database.increment_gemini_quota_count(_today())
 
-    async def generate(self, user_content: str) -> str:
+    async def generate(self, user_content: str, *, strict: bool = False) -> str:
         client = self._get_client()
         try:
             response = await client.aio.models.generate_content(
                 model=self._MODEL,
                 contents=user_content,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=_SYSTEM_PROMPT,
+                    system_instruction=_STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     max_output_tokens=256,
                     # Extended thinking just burns quota/tokens for this
@@ -248,7 +321,7 @@ class GroqProvider:
     def record_call(self) -> None:
         database.increment_groq_quota_count(_today())
 
-    async def generate(self, user_content: str) -> str:
+    async def generate(self, user_content: str, *, strict: bool = False) -> str:
         client = self._get_client()
         try:
             response = await client.chat.completions.create(
@@ -256,7 +329,7 @@ class GroqProvider:
                 max_tokens=256,
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": _STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
             )
@@ -403,12 +476,47 @@ class AIProviderManager:
         ]
         logger.info("\n".join(lines))
 
+    @staticmethod
+    async def _generate_and_classify(provider, user_content: str, *, strict: bool = False):
+        """Calls provider.generate() once and returns ("success", text) or
+        ("quota_exhausted" | "transient" | "fatal", exc) — never raises, so
+        callers can branch without duplicating try/except blocks.
+        """
+        try:
+            text = await provider.generate(user_content, strict=strict)
+            return "success", text
+        except QuotaExhaustedError as exc:
+            return "quota_exhausted", exc
+        except TransientProviderError as exc:
+            return "transient", exc
+        except FatalProviderError as exc:
+            return "fatal", exc
+
+    def _record_quota_exhausted(self, provider, exc, stat_date: str) -> None:
+        provider.mark_quota_exhausted()
+        self.health[provider.name].last_error = str(exc)
+        database.record_provider_quota_exhaustion(provider.name, stat_date)
+        logger.warning("%s quota exhausted", _DISPLAY_NAME[provider.name])
+
+    def _record_real_failure(self, provider, exc, stat_date: str, *, context: str = "") -> None:
+        health = self.health[provider.name]
+        if health.record_failure(str(exc)):
+            database.record_provider_circuit_breaker_activation(provider.name, stat_date)
+        database.record_provider_failure(provider.name, stat_date)
+        logger.error("%s failed%s (non-retryable): %s", _DISPLAY_NAME[provider.name], context, exc)
+
     async def _attempt(self, provider, user_content: str, max_attempts: int, *, is_probe: bool = False) -> AIVerdict | None:
         """Calls `provider` up to max_attempts times (1 = no retry, used for
         circuit-breaker probes), retrying only TransientProviderError with
         exponential backoff + jitter. Returns the parsed verdict on success,
         or None if every attempt failed / the breaker tripped mid-retry.
         Quota exhaustion and fatal errors stop immediately (never retried).
+
+        A response that comes back but fails to parse/validate (malformed
+        JSON, missing schema fields) is NOT immediately treated as a
+        provider failure: exactly one repair retry is sent with a stricter
+        prompt before falling back to the normal failure/failover path —
+        see _repair_malformed_response.
         """
         health = self.health[provider.name]
         stat_date = _today()
@@ -416,26 +524,20 @@ class AIProviderManager:
         while True:
             health.record_attempt()
             start = time.monotonic()
-            try:
-                text = await provider.generate(user_content)
-            except QuotaExhaustedError as exc:
-                # Quota exhaustion is tracked independently of the transient-
-                # failure circuit breaker (it's already a hard, deterministic
-                # gate via quota_exhausted() for the rest of the day) — don't
-                # also count it toward consecutive_failures/health.healthy.
-                provider.mark_quota_exhausted()
-                health.last_error = str(exc)
-                database.record_provider_quota_exhaustion(provider.name, stat_date)
-                logger.warning("%s quota exhausted", _DISPLAY_NAME[provider.name])
+            kind, payload = await self._generate_and_classify(provider, user_content)
+
+            if kind == "quota_exhausted":
+                self._record_quota_exhausted(provider, payload, stat_date)
                 return None
-            except TransientProviderError as exc:
-                if health.record_failure(str(exc)):
+
+            if kind == "transient":
+                if health.record_failure(str(payload)):
                     database.record_provider_circuit_breaker_activation(provider.name, stat_date)
                 database.record_provider_failure(provider.name, stat_date)
                 attempt += 1
                 if attempt >= max_attempts or not health.healthy:
                     logger.error(
-                        "%s failed after %d attempt(s): %s", _DISPLAY_NAME[provider.name], attempt, exc
+                        "%s failed after %d attempt(s): %s", _DISPLAY_NAME[provider.name], attempt, payload
                     )
                     return None
                 backoff = min(
@@ -452,13 +554,13 @@ class AIProviderManager:
                 )
                 await asyncio.sleep(backoff + jitter)
                 continue
-            except FatalProviderError as exc:
-                if health.record_failure(str(exc)):
-                    database.record_provider_circuit_breaker_activation(provider.name, stat_date)
-                database.record_provider_failure(provider.name, stat_date)
-                logger.error("%s failed (non-retryable): %s", _DISPLAY_NAME[provider.name], exc)
+
+            if kind == "fatal":
+                self._record_real_failure(provider, payload, stat_date)
                 return None
 
+            # kind == "success"
+            text = payload
             latency_ms = (time.monotonic() - start) * 1000
             logger.debug("%s AI request duration: %.0f ms", _DISPLAY_NAME[provider.name], latency_ms)
 
@@ -474,19 +576,65 @@ class AIProviderManager:
                     logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
                 return None
 
-            verdict = _parse_verdict(text, provider.name)
-            if verdict is None:
-                if health.record_failure("malformed response"):
-                    database.record_provider_circuit_breaker_activation(provider.name, stat_date)
-                database.record_provider_failure(provider.name, stat_date)
-                return None
-            was_unhealthy = not health.healthy
-            health.record_success(latency_ms)
-            provider.record_call()
-            database.record_provider_success(provider.name, stat_date, latency_ms)
-            if was_unhealthy:
-                logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
+            result = _classify_and_parse(text, provider.name)
+            if result.verdict is not None:
+                if result.recovery_log:
+                    logger.info(result.recovery_log)
+                self._record_success(provider, health, latency_ms, stat_date)
+                return result.verdict
+
+            verdict = await self._repair_malformed_response(
+                provider, user_content, result.failure_reason, stat_date
+            )
             return verdict
+
+    async def _repair_malformed_response(
+        self, provider, user_content: str, failure_reason: str, stat_date: str
+    ) -> AIVerdict | None:
+        """A response came back but failed to parse/validate. Sends exactly
+        one repair retry with a stricter prompt before treating this as a
+        real provider failure — never counted as a provider failure itself,
+        only the outcome of the repair retry is (if it also fails).
+        """
+        health = self.health[provider.name]
+        logger.info("%s — retrying once", failure_reason)
+
+        health.record_attempt()
+        retry_start = time.monotonic()
+        kind, payload = await self._generate_and_classify(provider, user_content, strict=True)
+
+        if kind == "quota_exhausted":
+            self._record_quota_exhausted(provider, payload, stat_date)
+            return None
+
+        if kind in ("transient", "fatal"):
+            # A genuine provider error on the repair retry is a real failure
+            # — not a formatting problem — so it's handled by the normal
+            # failure path, not retried again.
+            self._record_real_failure(provider, payload, stat_date, context=" on repair retry")
+            return None
+
+        # kind == "success"
+        retry_latency_ms = (time.monotonic() - retry_start) * 1000
+        retry_result = _classify_and_parse(payload, provider.name)
+        if retry_result.verdict is not None:
+            logger.info("Malformed AI response recovered after retry")
+            self._record_success(provider, health, retry_latency_ms, stat_date)
+            return retry_result.verdict
+
+        logger.warning("Malformed AI response unrecoverable — failing over")
+        if health.record_failure("malformed response (unrecovered after retry)"):
+            database.record_provider_circuit_breaker_activation(provider.name, stat_date)
+        database.record_provider_failure(provider.name, stat_date)
+        return None
+
+    def _record_success(self, provider, health: ProviderHealth, latency_ms: float, stat_date: str) -> None:
+        was_unhealthy = not health.healthy
+        health.record_success(latency_ms)
+        provider.record_call()
+        database.record_provider_success(provider.name, stat_date, latency_ms)
+        if was_unhealthy:
+            logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
 
     async def get_verdict(
         self, raw_text: str, title: str, price: float, discount_percent: int | None,

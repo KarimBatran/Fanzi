@@ -286,6 +286,108 @@ def test_parse_verdict_tolerates_trailing_extra_brace():
     assert verdict.category == "accessory"
 
 
+_FENCED_JSON = "```json\n" + _VALID_JSON + "\n```"
+_LEADING_PROSE_JSON = "Here is the analysis:\n" + _VALID_JSON
+_TRAILING_COMMENTARY_JSON = _VALID_JSON + "\nHope this helps."
+_MISSING_FIELD_JSON = '{"deal_quality": "good", "reason": "Decent deal.", "suggested_target": 900}'  # no "category"
+
+
+@pytest.mark.asyncio
+async def test_markdown_fenced_json_recovered_without_retry():
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_FENCED_JSON)) as gemini_generate:
+        verdict = await _get_verdict(manager)
+    assert gemini_generate.call_count == 1  # no repair retry needed
+    assert verdict is not None
+    assert verdict.provider == "gemini"
+    assert verdict.deal_quality == "great"
+
+
+@pytest.mark.asyncio
+async def test_leading_explanatory_text_recovered_without_retry():
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_LEADING_PROSE_JSON)) as gemini_generate:
+        verdict = await _get_verdict(manager)
+    assert gemini_generate.call_count == 1
+    assert verdict is not None
+    assert verdict.deal_quality == "great"
+
+
+@pytest.mark.asyncio
+async def test_trailing_commentary_recovered_without_retry():
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_TRAILING_COMMENTARY_JSON)) as gemini_generate:
+        verdict = await _get_verdict(manager)
+    assert gemini_generate.call_count == 1
+    assert verdict is not None
+    assert verdict.deal_quality == "great"
+
+
+@pytest.mark.asyncio
+async def test_missing_required_field_triggers_exactly_one_repair_retry():
+    manager = _manager()
+    with patch.object(
+        manager.gemini, "generate", new=AsyncMock(side_effect=[_MISSING_FIELD_JSON, _VALID_JSON])
+    ) as gemini_generate:
+        verdict = await _get_verdict(manager)
+
+    assert gemini_generate.call_count == 2
+    # The repair retry must use the stricter prompt.
+    assert gemini_generate.call_args_list[1].kwargs.get("strict") is True
+    assert gemini_generate.call_args_list[0].kwargs.get("strict") in (False, None)
+    assert verdict is not None
+    assert verdict.provider == "gemini"
+    assert verdict.deal_quality == "great"
+
+
+@pytest.mark.asyncio
+async def test_successful_repair_retry_does_not_increment_failure_counters():
+    import database
+    from listener.ai_providers import _today
+
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(side_effect=[_MISSING_FIELD_JSON, _VALID_JSON])):
+        verdict = await _get_verdict(manager)
+
+    assert verdict is not None
+    assert manager.health["gemini"].consecutive_failures == 0
+    assert manager.health["gemini"].healthy is True
+    stats = database.get_provider_stats("gemini", _today())
+    assert stats["failed_requests"] == 0
+    assert stats["successful_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_retry_also_malformed_fails_over_normally():
+    import database
+    from listener.ai_providers import _today
+
+    manager = _manager()
+    with patch.object(
+        manager.gemini, "generate", new=AsyncMock(side_effect=[_MISSING_FIELD_JSON, _MISSING_FIELD_JSON])
+    ) as gemini_generate, patch.object(manager.groq, "generate", new=AsyncMock(return_value=_VALID_JSON)):
+        verdict = await _get_verdict(manager)
+
+    assert gemini_generate.call_count == 2  # original + exactly one repair retry, no more
+    assert verdict is not None
+    assert verdict.provider == "groq"  # normal failover executed
+
+    # Exactly one failure counted for the whole malformed+failed-retry group.
+    assert manager.health["gemini"].consecutive_failures == 1
+    stats = database.get_provider_stats("gemini", _today())
+    assert stats["failed_requests"] == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_valid_json_still_parses_normally_no_retry():
+    manager = _manager()
+    with patch.object(manager.gemini, "generate", new=AsyncMock(return_value=_VALID_JSON)) as gemini_generate:
+        verdict = await _get_verdict(manager)
+    assert gemini_generate.call_count == 1
+    assert verdict is not None
+    assert verdict.deal_quality == "great"
+
+
 def test_parse_verdict_still_rejects_genuine_mid_object_corruption():
     """Real production case: a stray quote landed *inside* the object,
     before it closed ("Expecting ',' delimiter"). This is genuine

@@ -505,7 +505,9 @@ class AIProviderManager:
         database.record_provider_failure(provider.name, stat_date)
         logger.error("%s failed%s (non-retryable): %s", _DISPLAY_NAME[provider.name], context, exc)
 
-    async def _attempt(self, provider, user_content: str, max_attempts: int, *, is_probe: bool = False) -> AIVerdict | None:
+    async def _attempt(
+        self, provider, user_content: str, max_attempts: int, *, is_probe: bool = False, timing=None,
+    ) -> AIVerdict | None:
         """Calls `provider` up to max_attempts times (1 = no retry, used for
         circuit-breaker probes), retrying only TransientProviderError with
         exponential backoff + jitter. Returns the parsed verdict on success,
@@ -517,10 +519,15 @@ class AIProviderManager:
         provider failure: exactly one repair retry is sent with a stricter
         prompt before falling back to the normal failure/failover path —
         see _repair_malformed_response.
+
+        `timing` (a listener.timing.DealTiming, optional) records
+        request/retry/parse durations for the per-deal timing summary — a
+        pure instrumentation hook, never read back to affect behavior here.
         """
         health = self.health[provider.name]
         stat_date = _today()
         attempt = 0
+        group_start = time.monotonic()  # covers this whole attempt group, incl. retries/backoff
         while True:
             health.record_attempt()
             start = time.monotonic()
@@ -539,6 +546,9 @@ class AIProviderManager:
                     logger.error(
                         "%s failed after %d attempt(s): %s", _DISPLAY_NAME[provider.name], attempt, payload
                     )
+                    if timing:
+                        elapsed_ms = (time.monotonic() - group_start) * 1000
+                        timing.note(f"{_DISPLAY_NAME[provider.name]} failed after {elapsed_ms:.0f} ms")
                     return None
                 backoff = min(
                     AI_RETRY_INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1)), AI_RETRY_MAX_BACKOFF_SECONDS
@@ -557,6 +567,9 @@ class AIProviderManager:
 
             if kind == "fatal":
                 self._record_real_failure(provider, payload, stat_date)
+                if timing:
+                    elapsed_ms = (time.monotonic() - group_start) * 1000
+                    timing.note(f"{_DISPLAY_NAME[provider.name]} failed after {elapsed_ms:.0f} ms")
                 return None
 
             # kind == "success"
@@ -576,20 +589,26 @@ class AIProviderManager:
                     logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
                 return None
 
+            parse_start = time.monotonic()
             result = _classify_and_parse(text, provider.name)
+            if timing:
+                timing.record("ai_parse", (time.monotonic() - parse_start) * 1000)
             if result.verdict is not None:
                 if result.recovery_log:
                     logger.info(result.recovery_log)
                 self._record_success(provider, health, latency_ms, stat_date)
+                if timing and attempt > 0:
+                    elapsed_ms = (time.monotonic() - group_start) * 1000
+                    timing.note(f"{_DISPLAY_NAME[provider.name]} recovered in {elapsed_ms:.0f} ms")
                 return result.verdict
 
             verdict = await self._repair_malformed_response(
-                provider, user_content, result.failure_reason, stat_date
+                provider, user_content, result.failure_reason, stat_date, timing=timing
             )
             return verdict
 
     async def _repair_malformed_response(
-        self, provider, user_content: str, failure_reason: str, stat_date: str
+        self, provider, user_content: str, failure_reason: str, stat_date: str, *, timing=None,
     ) -> AIVerdict | None:
         """A response came back but failed to parse/validate. Sends exactly
         one repair retry with a stricter prompt before treating this as a
@@ -616,7 +635,10 @@ class AIProviderManager:
 
         # kind == "success"
         retry_latency_ms = (time.monotonic() - retry_start) * 1000
+        parse_start = time.monotonic()
         retry_result = _classify_and_parse(payload, provider.name)
+        if timing:
+            timing.record("ai_parse", (time.monotonic() - parse_start) * 1000)
         if retry_result.verdict is not None:
             logger.info("Malformed AI response recovered after retry")
             self._record_success(provider, health, retry_latency_ms, stat_date)
@@ -638,19 +660,21 @@ class AIProviderManager:
 
     async def get_verdict(
         self, raw_text: str, title: str, price: float, discount_percent: int | None,
-        channel_name: str, price_history: float | None,
+        channel_name: str, price_history: float | None, *, timing=None,
     ) -> AIVerdict | None:
         selection_start = time.monotonic()
         user_content = _build_user_content(raw_text, title, price, discount_percent, channel_name, price_history)
+        if timing:
+            timing.record("ai_selection", (time.monotonic() - selection_start) * 1000)
 
-        gemini_verdict = await self._try_provider(self.gemini, user_content)
+        gemini_verdict = await self._try_provider(self.gemini, user_content, timing=timing)
         if gemini_verdict is not None:
             self.last_provider_used = "gemini"
             logger.info("AIProviderManager selected Gemini")
             self._log_selection_time(selection_start)
             return gemini_verdict
 
-        groq_verdict = await self._try_provider(self.groq, user_content)
+        groq_verdict = await self._try_provider(self.groq, user_content, timing=timing)
         if groq_verdict is not None:
             self.last_provider_used = "groq"
             logger.info("AIProviderManager selected Groq (Gemini unavailable)")
@@ -668,7 +692,7 @@ class AIProviderManager:
         logger.info("Provider selection completed in %.0f ms", elapsed_ms)
         logger.debug("Provider selection time: %.0f ms", elapsed_ms)
 
-    async def _try_provider(self, provider, user_content: str) -> AIVerdict | None:
+    async def _try_provider(self, provider, user_content: str, *, timing=None) -> AIVerdict | None:
         health = self.health[provider.name]
         if health.disabled:
             logger.info("%s disabled (no API key) — skipping", _DISPLAY_NAME[provider.name])
@@ -676,18 +700,28 @@ class AIProviderManager:
 
         if provider.quota_exhausted():
             logger.info("%s quota exhausted for today — skipping", _DISPLAY_NAME[provider.name])
+            if timing:
+                timing.note(f"{_DISPLAY_NAME[provider.name]} skipped (quota exhausted)")
             return None
 
         can_attempt, is_probe = health.can_attempt()
         if not can_attempt:
             logger.info("%s in cooldown — skipping", _DISPLAY_NAME[provider.name])
+            if timing:
+                timing.note(f"{_DISPLAY_NAME[provider.name]} skipped (cooldown)")
             return None
 
+        stage_start = time.monotonic()
         if is_probe:
             logger.info("%s cooldown expired — sending single probe request", _DISPLAY_NAME[provider.name])
-            return await self._attempt(provider, user_content, max_attempts=1)
-
-        return await self._attempt(provider, user_content, max_attempts=AI_RETRY_COUNT + 1)
+            result = await self._attempt(provider, user_content, max_attempts=1, timing=timing)
+        else:
+            result = await self._attempt(
+                provider, user_content, max_attempts=AI_RETRY_COUNT + 1, timing=timing
+            )
+        if timing:
+            timing.record(provider.name, (time.monotonic() - stage_start) * 1000)
+        return result
 
     async def probe_if_ready(self, provider) -> None:
         """Used by the background recovery job: sends exactly one probe

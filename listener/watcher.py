@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from urllib.parse import urlsplit, urlunsplit
 
 # Same embeddable-Python sys.path workaround as bot.py (see the comment
@@ -37,6 +38,8 @@ import database
 import health
 from config import (
     ADMIN_TELEGRAM_ID,
+    AI_SOFT_TIMEOUT_ENABLED,
+    AI_SOFT_TIMEOUT_SECONDS,
     MIN_DEAL_QUALITY,
     TELEGRAM_BOT_TOKEN,
     TELETHON_API_HASH,
@@ -45,8 +48,9 @@ from config import (
 )
 from listener import channels_store, dedup, pending_deals
 from listener.ai_providers import get_manager
-from listener.analyzer import analyze_deal, meets_min_quality
+from listener.analyzer import DealVerdict, analyze_deal, meets_min_quality
 from listener.parser import ParsedDeal, extract_from_post
+from listener.timing import DealTiming
 
 logger = logging.getLogger("fanzi.listener.watcher")
 
@@ -90,17 +94,48 @@ def _track_button(asin: str) -> InlineKeyboardMarkup:
     )
 
 
+def _unavailable_verdict_text() -> str:
+    # Both providers failed/skipped for one of several reasons — forward the
+    # raw deal without a verdict rather than dropping it, but distinguish
+    # "both providers' daily quota is used up" (expected, not an app bug)
+    # from an actual API/parser failure so the admin isn't misled into
+    # thinking something is broken every time quota runs out.
+    if get_manager().both_quota_exhausted():
+        return "unavailable (daily AI quota reached on both providers)"
+    return "unavailable (analysis failed)"
+
+
+def _build_message_for_verdict(deal: ParsedDeal, verdict: DealVerdict | None, clean_url: str) -> str:
+    if verdict is None:
+        return _format_message(deal, _unavailable_verdict_text(), clean_url)
+    if verdict.provider == "learned":
+        # Honest about the source — never presented as if AI just analyzed
+        # this deal (see listener/learning.py's format_explanation()).
+        return _format_message(deal, verdict.reason, clean_url, verdict_is_explanation=True)
+    emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
+    return _format_message(deal, f"{emoji} {verdict.reason}", clean_url)
+
+
 async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     logger.info("[%s] Post received: %s", channel_name, text[:50].replace("\n", " "))
+    timing = DealTiming(channel=channel_name)
 
+    parse_start = time.perf_counter()
     deal = await extract_from_post(text, channel_name)
+    timing.record("parser", (time.perf_counter() - parse_start) * 1000)
     if deal is None:
         logger.info("[%s] No ASIN found — skipping", channel_name)
         return
+    timing.asin = deal.asin
+    timing.title = deal.title
+    if deal.redirect_ms:
+        timing.record("redirect", deal.redirect_ms)
     logger.info("[%s] ASIN extracted: %s", channel_name, deal.asin)
 
+    dedup_start = time.perf_counter()
     dedup_outcome = dedup.check(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
     if dedup_outcome == dedup.DUPLICATE:
+        timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
         logger.info("[%s] duplicate deal skipped", channel_name)
         health.record_duplicate_skipped()
         return
@@ -109,48 +144,104 @@ async def _handle_post(bot: Bot, text: str, channel_name: str) -> None:
     elif dedup_outcome == dedup.WINDOW_EXPIRED:
         logger.info("[%s] duplicate window expired — reprocessing", channel_name)
     dedup.mark_seen(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
+    timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
 
     clean_url = _strip_affiliate_tag(deal.url) if deal.url else f"https://www.amazon.eg/dp/{deal.asin}"
     pending_deals.store(deal.asin, deal.title, clean_url, deal.price, deal.discount_percent)
 
     price_history = database.get_latest_price_for_asin(deal.asin)
-    verdict = await analyze_deal(deal, price_history)
 
+    if not AI_SOFT_TIMEOUT_ENABLED:
+        verdict = await analyze_deal(deal, price_history, timing=timing)
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing)
+        return
+
+    analysis_task = asyncio.create_task(analyze_deal(deal, price_history, timing=timing))
+    done, _pending = await asyncio.wait({analysis_task}, timeout=AI_SOFT_TIMEOUT_SECONDS)
+
+    if analysis_task in done:
+        verdict = analysis_task.result()
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing)
+        return
+
+    # AI hasn't answered within the soft timeout — user experience over
+    # waiting indefinitely: forward now with a placeholder, keep analyzing in
+    # the background, and edit this same message in place once it finishes.
+    logger.info(
+        "[%s] AI soft timeout (%.1fs) — forwarding placeholder, analysis continues in background",
+        channel_name, AI_SOFT_TIMEOUT_SECONDS,
+    )
+    placeholder_text = _format_message(deal, "analyzing...", clean_url)
+    send_start = time.perf_counter()
+    message = await bot.send_message(
+        chat_id=ADMIN_TELEGRAM_ID, text=placeholder_text, reply_markup=_track_button(deal.asin)
+    )
+    timing.record("telegram_send", (time.perf_counter() - send_start) * 1000)
+    timing.note(f"AI timed out after {AI_SOFT_TIMEOUT_SECONDS * 1000:.0f} ms — forwarded with placeholder")
+    timing.log_summary()
+
+    asyncio.create_task(
+        _finish_analysis_in_background(
+            bot, analysis_task, deal, clean_url, channel_name, message.chat_id, message.message_id
+        )
+    )
+
+
+async def _forward_verdict(
+    bot: Bot, deal: ParsedDeal, verdict: DealVerdict | None, clean_url: str, channel_name: str, timing: DealTiming,
+) -> None:
+    """Shared by both the normal (AI answered in time) and soft-timeout
+    (AI answered late, called from the immediate path when it happens to
+    finish inside the timeout window) code paths.
+    """
     if verdict is None:
         logger.info("[%s] AI providers unavailable — forwarding without verdict", channel_name)
-        # Both providers failed/skipped for one of several reasons — forward
-        # the raw deal without a verdict rather than dropping it, but
-        # distinguish "both providers' daily quota is used up" (expected, not
-        # an app bug) from an actual API/parser failure so the admin isn't
-        # misled into thinking something is broken every time quota runs out.
-        if get_manager().both_quota_exhausted():
-            verdict_text = "unavailable (daily AI quota reached on both providers)"
-        else:
-            verdict_text = "unavailable (analysis failed)"
-        message = _format_message(deal, verdict_text, clean_url)
-        await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
-        logger.info("[%s] Forwarding to admin", channel_name)
-        return
-
-    logger.info(
-        "[%s] AI verdict (%s): %s — %s", channel_name, verdict.provider, verdict.deal_quality, verdict.reason
-    )
-    health.record_deal_analyzed()
-
-    if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
-        logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
-        return
-
-    if verdict.provider == "learned":
-        # Honest about the source — never presented as if AI just analyzed
-        # this deal (see listener/learning.py's format_explanation()).
-        message = _format_message(deal, verdict.reason, clean_url, verdict_is_explanation=True)
     else:
-        emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
-        verdict_text = f"{emoji} {verdict.reason}"
-        message = _format_message(deal, verdict_text, clean_url)
+        logger.info(
+            "[%s] AI verdict (%s): %s — %s", channel_name, verdict.provider, verdict.deal_quality, verdict.reason
+        )
+        health.record_deal_analyzed()
+        if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
+            logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
+            timing.log_summary()
+            return
+
+    message_text = _build_message_for_verdict(deal, verdict, clean_url)
+    send_start = time.perf_counter()
+    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message_text, reply_markup=_track_button(deal.asin))
+    timing.record("telegram_send", (time.perf_counter() - send_start) * 1000)
     logger.info("[%s] Forwarding to admin", channel_name)
-    await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message, reply_markup=_track_button(deal.asin))
+    timing.log_summary()
+
+
+async def _finish_analysis_in_background(
+    bot: Bot, analysis_task: asyncio.Task, deal: ParsedDeal, clean_url: str, channel_name: str,
+    chat_id: int, message_id: int,
+) -> None:
+    """Awaits the AI analysis that outran the soft timeout, then edits the
+    already-forwarded placeholder message in place with the real verdict.
+    If AI ultimately fails, the placeholder is left unchanged — no duplicate
+    notification is ever sent for the same deal.
+    """
+    try:
+        verdict = await analysis_task
+    except Exception:
+        logger.exception("[%s] background analysis failed for %s — leaving message unchanged", channel_name, deal.asin)
+        return
+
+    if verdict is None:
+        logger.info(
+            "[%s] background analysis unavailable for %s — leaving message unchanged", channel_name, deal.asin
+        )
+        return
+
+    health.record_deal_analyzed()
+    new_text = _build_message_for_verdict(deal, verdict, clean_url)
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
+        logger.info("[%s] Edited placeholder with delayed verdict (%s) for %s", channel_name, verdict.provider, deal.asin)
+    except Exception:
+        logger.exception("[%s] failed to edit placeholder message for %s", channel_name, deal.asin)
 
 
 def _make_message_handler(bot: Bot):

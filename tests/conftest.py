@@ -41,3 +41,16 @@ def block_real_ai_providers(monkeypatch):
     monkeypatch.setattr(GeminiProvider, "_get_client", _forbidden_client)
     monkeypatch.setattr(GroqProvider, "_get_client", _forbidden_client)
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_redirect_cache():
+    """listener.parser caches resolved redirects across calls (short TTL, by
+    design, in production) — several tests reuse the same URL expecting
+    different mocked responses, so the cache must not leak between tests.
+    """
+    import listener.parser as parser_module
+
+    parser_module._redirect_cache.clear()
+    yield
+    parser_module._redirect_cache.clear()

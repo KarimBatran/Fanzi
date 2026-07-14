@@ -37,7 +37,9 @@ def meets_min_quality(deal_quality: str, min_quality: str) -> bool:
     return _QUALITY_RANK.get(deal_quality, 0) >= _QUALITY_RANK.get(min_quality, 2)
 
 
-async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVerdict | None:
+async def analyze_deal(
+    deal: ParsedDeal, price_history: float | None, *, timing=None,
+) -> DealVerdict | None:
     """Returns a DealVerdict, or None if analysis couldn't be completed by
     either provider — callers fall back to forwarding the raw deal with an
     "unavailable" verdict rather than dropping it. A low-discount post gets a
@@ -47,15 +49,20 @@ async def analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVer
 
     Cheap checks (no price, low discount) run before any provider is touched,
     exactly as before this module started delegating to AIProviderManager.
+
+    `timing` (a listener.timing.DealTiming, optional, keyword-only) records
+    stage durations for the per-deal timing summary — the required
+    (deal, price_history) positional signature and return value are
+    unchanged, so this is purely additive instrumentation.
     """
     start = time.monotonic()
     try:
-        return await _analyze_deal(deal, price_history)
+        return await _analyze_deal(deal, price_history, timing=timing)
     finally:
         logger.debug("End-to-end analysis duration: %.0f ms", (time.monotonic() - start) * 1000)
 
 
-async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVerdict | None:
+async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing=None) -> DealVerdict | None:
     if deal.price is None or deal.price <= 0:
         logger.info("skipped analysis (no price)")
         return None
@@ -70,9 +77,12 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVe
             provider="none",
         )
 
+    rule_lookup_start = time.monotonic()
     brand = learning.extract_brand(deal.title)
     guessed_category = learning.guess_category(deal.title)
     decision = learning.decide(brand, guessed_category, deal.price, deal.discount_percent)
+    if timing:
+        timing.record("rule_lookup", (time.monotonic() - rule_lookup_start) * 1000)
     stat_date = date.today().isoformat()
 
     if decision.kind == "rule":
@@ -109,6 +119,7 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVe
         discount_percent=deal.discount_percent,
         channel_name=deal.channel_name,
         price_history=price_history,
+        timing=timing,
     )
     if verdict is None:
         return None
@@ -127,12 +138,15 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None) -> DealVe
 
     # Every successful real AI verdict becomes training data — fire-and-forget
     # so this never delays forwarding the deal.
+    enqueue_start = time.monotonic()
     learning.spawn_learning_task(
         asin=deal.asin, provider=verdict.provider, brand=brand, category=verdict.category,
         title=deal.title, price=deal.price, discount_percent=deal.discount_percent,
         deal_quality=verdict.deal_quality, reason=verdict.reason,
         suggested_target=verdict.suggested_target, channel=deal.channel_name,
     )
+    if timing:
+        timing.record("learning_enqueue", (time.monotonic() - enqueue_start) * 1000)
 
     return DealVerdict(
         deal_quality=verdict.deal_quality,

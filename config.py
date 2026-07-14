@@ -63,3 +63,25 @@ RULE_OUTLIER_DISCOUNT = int(os.getenv("RULE_OUTLIER_DISCOUNT", "50"))
 # Not explicitly named in the original spec's config list, but required by
 # its own "extremely low price" outlier condition — same env-driven pattern.
 RULE_OUTLIER_MIN_PRICE = float(os.getenv("RULE_OUTLIER_MIN_PRICE", "30"))
+
+# Forwarding-pipeline performance instrumentation (listener/timing.py,
+# listener/watcher.py). PERFORMANCE_LOGGING gates the per-deal timing
+# summary (negligible cost either way — perf_counter() calls are cheap —
+# but keeps normal logs quiet if turned off); the slow-request WARNING
+# always fires regardless, so outliers stay visible either way.
+PERFORMANCE_LOGGING = os.getenv("PERFORMANCE_LOGGING", "true").lower() == "true"
+SLOW_REQUEST_THRESHOLD_SECONDS = float(os.getenv("SLOW_REQUEST_THRESHOLD_SECONDS", "3.0"))
+
+# AI soft timeout (listener/watcher.py): if analysis hasn't completed within
+# this long, the deal is forwarded immediately with a placeholder verdict and
+# the AI call continues in the background, editing the message in place once
+# it finishes. Set AI_SOFT_TIMEOUT_ENABLED=false to always wait for AI
+# (the old behavior).
+AI_SOFT_TIMEOUT_ENABLED = os.getenv("AI_SOFT_TIMEOUT_ENABLED", "true").lower() == "true"
+AI_SOFT_TIMEOUT_SECONDS = float(os.getenv("AI_SOFT_TIMEOUT_SECONDS", "2.5"))
+
+# Short-TTL cache for resolved shortener/link.amazon redirects
+# (listener/parser.py) — the same deal link is often reposted/crossposted
+# across channels within minutes; caching avoids a redundant network
+# round-trip for an identical URL seen again inside the TTL window.
+REDIRECT_CACHE_TTL_SECONDS = float(os.getenv("REDIRECT_CACHE_TTL_SECONDS", "300"))

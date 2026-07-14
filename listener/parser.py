@@ -9,14 +9,39 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
 from amazon.parser import extract_asin, normalize_product_url
+from config import REDIRECT_CACHE_TTL_SECONDS
 
 logger = logging.getLogger("fanzi.listener.parser")
+
+# Short-TTL cache for resolved link.amazon/generic-shortener redirects — the
+# same deal link is often crossposted across multiple channels within
+# minutes, and this avoids a redundant real network round-trip for an
+# identical URL seen again inside the TTL window. Maps url -> (asin_or_None,
+# expiry_monotonic_time). A negative-cache entry (asin=None) is cached too,
+# for the same reason (a dead link stays dead for the TTL window).
+_redirect_cache: dict[str, tuple[str | None, float]] = {}
+
+
+def _redirect_cache_get(url: str) -> tuple[bool, str | None]:
+    entry = _redirect_cache.get(url)
+    if entry is None:
+        return False, None
+    asin, expiry = entry
+    if time.monotonic() >= expiry:
+        del _redirect_cache[url]
+        return False, None
+    return True, asin
+
+
+def _redirect_cache_set(url: str, asin: str | None) -> None:
+    _redirect_cache[url] = (asin, time.monotonic() + REDIRECT_CACHE_TTL_SECONDS)
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -73,6 +98,7 @@ class ParsedDeal:
     channel_name: str
     raw_text: str
     url: str
+    redirect_ms: float = 0.0
 
 
 async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | None:
@@ -85,9 +111,12 @@ async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | N
     urls = _URL_RE.findall(normalized)
     asin: str | None = None
     matched_url = ""
+    redirect_ms = 0.0
     async with httpx.AsyncClient(follow_redirects=True, timeout=_REDIRECT_TIMEOUT_SECONDS) as client:
         for url in urls:
+            redirect_start = time.perf_counter()
             found = await _extract_asin_from_url(url, client)
+            redirect_ms += (time.perf_counter() - redirect_start) * 1000
             if found:
                 asin = found
                 matched_url = url
@@ -117,6 +146,7 @@ async def extract_from_post(text: str, channel_name: str = "") -> ParsedDeal | N
         channel_name=channel_name,
         raw_text=text,
         url=matched_url or normalize_product_url(asin),
+        redirect_ms=redirect_ms,
     )
 
 
@@ -149,6 +179,16 @@ async def _extract_asin_from_url(url: str, client: httpx.AsyncClient) -> str | N
 
 
 async def _resolve_via_redirect(url: str, client: httpx.AsyncClient) -> str | None:
+    hit, cached_asin = _redirect_cache_get(url)
+    if hit:
+        return cached_asin
+
+    asin = await _resolve_via_redirect_uncached(url, client)
+    _redirect_cache_set(url, asin)
+    return asin
+
+
+async def _resolve_via_redirect_uncached(url: str, client: httpx.AsyncClient) -> str | None:
     try:
         # GET, not HEAD: link.amazon (and possibly other shorteners) reject
         # HEAD requests with a 404 but resolve correctly on GET.

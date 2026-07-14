@@ -122,7 +122,6 @@ async def extract_from_post(
 
     urls = _URL_RE.findall(normalized)
     asin: str | None = None
-    matched_url = ""
     redirect_ms = 0.0
     async with httpx.AsyncClient(follow_redirects=True, timeout=_REDIRECT_TIMEOUT_SECONDS) as client:
         for url in urls:
@@ -131,7 +130,6 @@ async def extract_from_post(
             redirect_ms += (time.perf_counter() - redirect_start) * 1000
             if found:
                 asin = found
-                matched_url = url
                 break
 
     if asin is None:
@@ -164,7 +162,10 @@ async def extract_from_post(
         discount_percent=_extract_discount(normalized),
         channel_name=channel_name,
         raw_text=text,
-        url=matched_url or normalize_product_url(asin),
+        # Always the canonical Amazon product URL we generate ourselves --
+        # never the original channel post's link.amazon/tinyurl/tracking
+        # URL (matched_url), regardless of whether that link ever appeared.
+        url=normalize_product_url(asin),
         redirect_ms=redirect_ms,
     )
 

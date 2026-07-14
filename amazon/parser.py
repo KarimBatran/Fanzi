@@ -10,6 +10,8 @@ import re
 
 import httpx
 
+from config import AMAZON_AFFILIATE_TAG
+
 logger = logging.getLogger("fanzi.amazon.parser")
 
 _BARE_ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
@@ -18,7 +20,14 @@ _SHORT_LINK_HOSTS = ("amzn.eu", "amzn.to", "a.co")
 
 
 def normalize_product_url(asin: str) -> str:
-    return f"https://www.amazon.eg/dp/{asin}"
+    """The one and only place a product URL is generated — always this
+    canonical form, optionally with our own configured affiliate tag, never
+    a source channel's original short/tracking link.
+    """
+    url = f"https://www.amazon.eg/dp/{asin}"
+    if AMAZON_AFFILIATE_TAG:
+        url += f"?tag={AMAZON_AFFILIATE_TAG}"
+    return url
 
 
 async def extract_asin(text: str, http_client: httpx.AsyncClient | None = None) -> str | None:

@@ -64,15 +64,16 @@ from config import (
 logger = logging.getLogger("fanzi.listener.ai_providers")
 
 _SYSTEM_PROMPT = (
-    "You are a deal analyst for Amazon Egypt. You receive a product deal post "
-    "and optional price history. Return ONLY a JSON object with these exact "
-    "keys: deal_quality (one of: great/good/average/skip), reason (one "
-    "sentence, English, max 15 words), suggested_target (integer EGP, 5-10% "
-    "below current price for good deals, same as current for average), "
-    "category (phone/headphones/laptop/accessory/cable/appliance/other). "
-    "Judge based on: discount percentage mentioned, product category "
-    "prestige, price vs history if available. Be conservative — most deals "
-    "are average."
+    "You are a deal analyst for Amazon Egypt. You receive ONLY structured "
+    "product information (title, brand, category hint, price, discount, "
+    "channel, price history) — never a URL or product link. Return ONLY a "
+    "JSON object with these exact keys: deal_quality (one of: "
+    "great/good/average/skip), reason (one sentence, English, max 15 "
+    "words), suggested_target (integer EGP, 5-10% below current price for "
+    "good deals, same as current for average), category "
+    "(phone/headphones/laptop/accessory/cable/appliance/other). Judge based "
+    "on: discount percentage, product category prestige, brand, price vs "
+    "history if available. Be conservative — most deals are average."
 )
 
 _STRICT_SYSTEM_PROMPT = (
@@ -91,12 +92,15 @@ _DISPLAY_NAME = {"gemini": "Gemini", "groq": "Groq"}
 # How many recent latency samples feed the rolling average shown in /status.
 _LATENCY_WINDOW = 20
 
+_URL_STRIP_RE = re.compile(r"https?://\S+")
+
 # Minimal synthetic content for a proactive background-recovery probe — it
-# only needs to look enough like a real deal post that the model returns a
-# parseable verdict; the verdict itself is discarded.
+# only needs to look enough like real structured input that the model
+# returns a parseable verdict; the verdict itself is discarded.
 _PROBE_CONTENT = (
-    "Probe request — health check only.\n\nParsed: title='probe', price=100 EGP, "
-    "discount=10%, channel=system. No price history available."
+    "Structured product information (no URLs, no ASIN, no tracking parameters):\n"
+    "title='probe'\nbrand=unknown\ncategory_hint=unknown\nprice=100 EGP\n"
+    "discount=10%\nchannel=system\nNo price history available."
 )
 
 
@@ -223,14 +227,33 @@ def _parse_verdict(text: str, provider: str) -> AIVerdict | None:
     return result.verdict
 
 
-def _build_user_content(raw_text: str, title: str, price: float, discount_percent: int | None, channel_name: str, price_history: float | None) -> str:
+def _sanitize_text_field(value: str) -> str:
+    """Defense-in-depth: strips any URL-looking substring from a structured
+    text field (title) before it reaches the AI prompt, in case a post's
+    first line happens to contain one — the AI must never see a URL/ASIN/
+    tracking parameter, only structured product data.
+    """
+    return _URL_STRIP_RE.sub("", value).strip()
+
+
+def _build_user_content(
+    title: str, price: float, discount_percent: int | None, channel_name: str,
+    price_history: float | None, brand: str | None, category_hint: str | None,
+) -> str:
+    """Builds the AI prompt from structured fields ONLY -- no raw post text,
+    no URL, no ASIN, no tracking parameters. See _SYSTEM_PROMPT.
+    """
     history_line = (
         f"Previously tracked price: {price_history:g} EGP." if price_history is not None else "No price history available."
     )
     return (
-        f"{raw_text}\n\n"
-        f"Parsed: title={title!r}, price={price:g} EGP, "
-        f"discount={discount_percent}%, channel={channel_name}. "
+        "Structured product information (no URLs, no ASIN, no tracking parameters):\n"
+        f"title={_sanitize_text_field(title)!r}\n"
+        f"brand={brand or 'unknown'}\n"
+        f"category_hint={category_hint or 'unknown'}\n"
+        f"price={price:g} EGP\n"
+        f"discount={discount_percent}%\n"
+        f"channel={channel_name}\n"
         f"{history_line}"
     )
 
@@ -659,11 +682,19 @@ class AIProviderManager:
             logger.info("%s recovered after cooldown", _DISPLAY_NAME[provider.name])
 
     async def get_verdict(
-        self, raw_text: str, title: str, price: float, discount_percent: int | None,
-        channel_name: str, price_history: float | None, *, timing=None,
+        self, title: str, price: float, discount_percent: int | None,
+        channel_name: str, price_history: float | None, *,
+        brand: str | None = None, category_hint: str | None = None, timing=None,
     ) -> AIVerdict | None:
+        """No raw_text/URL parameter by design — this manager (and every
+        provider beneath it) never receives the original post text or any
+        link, only the structured fields already extracted from it. See
+        _build_user_content.
+        """
         selection_start = time.monotonic()
-        user_content = _build_user_content(raw_text, title, price, discount_percent, channel_name, price_history)
+        user_content = _build_user_content(
+            title, price, discount_percent, channel_name, price_history, brand, category_hint
+        )
         if timing:
             timing.record("ai_selection", (time.monotonic() - selection_start) * 1000)
 

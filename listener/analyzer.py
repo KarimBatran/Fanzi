@@ -113,12 +113,13 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing
 
     manager = get_manager()
     verdict = await manager.get_verdict(
-        raw_text=deal.raw_text,
         title=deal.title,
         price=deal.price,
         discount_percent=deal.discount_percent,
         channel_name=deal.channel_name,
         price_history=price_history,
+        brand=brand,
+        category_hint=guessed_category,
         timing=timing,
     )
     if verdict is None:

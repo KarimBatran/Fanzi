@@ -80,9 +80,13 @@ CREATE TABLE IF NOT EXISTS provider_stats (
     PRIMARY KEY (provider, stat_date)
 );
 
--- Last-seen state per (channel, product) for duplicate-deal detection.
--- identifier is "asin:<ASIN>" or "title:<normalized title>" when no ASIN
--- was available. Re-processing updates price/discount/seen_at in place.
+-- DEPRECATED (kept only for historical data — no longer read or written).
+-- Its (channel_name, identifier) primary key scoped duplicate detection
+-- *per channel*, which was the root cause of the same product being
+-- forwarded once per channel that posted it. Replaced by
+-- global_duplicate_deals below, keyed on the canonical product identity
+-- alone. Left in place rather than dropped/migrated to avoid any risk to
+-- existing production data.
 CREATE TABLE IF NOT EXISTS duplicate_deals (
     channel_name TEXT NOT NULL,
     identifier TEXT NOT NULL,
@@ -90,6 +94,20 @@ CREATE TABLE IF NOT EXISTS duplicate_deals (
     last_discount_percent INTEGER,
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY (channel_name, identifier)
+);
+
+-- Last-seen state per canonical product (never per-channel) for duplicate
+-- detection. identifier priority: "asin:<ASIN>" (the canonical Amazon
+-- product identifier) when resolved, else "title:<normalized
+-- title>|price:<normalized price>" as a fallback only when no ASIN could be
+-- determined. The same product posted by two different channels now
+-- correctly matches the same row, so only the first forwards.
+CREATE TABLE IF NOT EXISTS global_duplicate_deals (
+    identifier TEXT PRIMARY KEY,
+    last_channel_name TEXT NOT NULL,
+    last_price REAL,
+    last_discount_percent INTEGER,
+    last_seen_at TEXT NOT NULL
 );
 
 -- Every successful (real Gemini/Groq) verdict — the raw training data for
@@ -599,8 +617,57 @@ def count_active_duplicate_records(cutoff_iso: str) -> int:
         return row["n"]
 
 
+def get_global_duplicate_record(identifier: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT last_price, last_discount_percent, last_seen_at
+            FROM global_duplicate_deals WHERE identifier = ?
+            """,
+            (identifier,),
+        ).fetchone()
+
+
+def upsert_global_duplicate_record(
+    identifier: str,
+    channel_name: str,
+    price: float | None,
+    discount_percent: int | None,
+    seen_at: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO global_duplicate_deals (identifier, last_channel_name, last_price, last_discount_percent, last_seen_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(identifier) DO UPDATE SET
+                last_channel_name = excluded.last_channel_name,
+                last_price = excluded.last_price,
+                last_discount_percent = excluded.last_discount_percent,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (identifier, channel_name, price, discount_percent, seen_at),
+        )
+
+
+def count_active_global_duplicate_records(cutoff_iso: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM global_duplicate_deals WHERE last_seen_at >= ?", (cutoff_iso,)
+        ).fetchone()
+        return row["n"]
+
+
+def delete_expired_global_duplicate_records(cutoff_iso: str) -> int:
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM global_duplicate_deals WHERE last_seen_at < ?", (cutoff_iso,))
+        return cursor.rowcount
+
+
 def delete_expired_duplicate_records(cutoff_iso: str) -> int:
-    """Purges rows older than the duplicate window. Returns the count deleted."""
+    """Deprecated alongside duplicate_deals (see schema comment) — no longer
+    called; kept only so any lingering reference doesn't hard-fail.
+    """
     with get_connection() as conn:
         cursor = conn.execute("DELETE FROM duplicate_deals WHERE last_seen_at < ?", (cutoff_iso,))
         return cursor.rowcount

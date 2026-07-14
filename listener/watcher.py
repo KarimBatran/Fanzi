@@ -20,7 +20,6 @@ import os
 import sys
 import time
 from datetime import date, datetime
-from urllib.parse import urlsplit, urlunsplit
 
 # Same embeddable-Python sys.path workaround as bot.py (see the comment
 # there): needed so `python listener\watcher.py` (standalone) can resolve
@@ -65,14 +64,6 @@ _bot: Bot | None = None
 _message_handler = None
 _reconnect_task: asyncio.Task | None = None
 _watched_channels: list[str] = []
-
-
-def _strip_affiliate_tag(url: str) -> str:
-    parts = urlsplit(url)
-    query_pairs = [
-        pair for pair in parts.query.split("&") if pair and not pair.startswith("tag=")
-    ]
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(query_pairs), ""))
 
 
 def _format_message(deal: ParsedDeal, verdict_text: str, clean_url: str, *, verdict_is_explanation: bool = False) -> str:
@@ -166,10 +157,10 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
     logger.info("[%s] ASIN extracted: %s", channel_name, deal.asin)
 
     dedup_start = time.perf_counter()
-    dedup_outcome = dedup.check(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
+    dedup_outcome = dedup.check(deal.asin, deal.title, deal.price, deal.discount_percent, channel_name=channel_name)
     if dedup_outcome == dedup.DUPLICATE:
         timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
-        logger.info("[%s] duplicate deal skipped", channel_name)
+        logger.info("[%s] duplicate deal skipped (already forwarded from another channel or earlier)", channel_name)
         health.record_duplicate_skipped()
         database.record_channel_duplicate(channel_name, stat_date)
         return
@@ -177,10 +168,14 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
         logger.info("[%s] price changed — reprocessing", channel_name)
     elif dedup_outcome == dedup.WINDOW_EXPIRED:
         logger.info("[%s] duplicate window expired — reprocessing", channel_name)
-    dedup.mark_seen(channel_name, deal.asin, deal.title, deal.price, deal.discount_percent)
+    dedup.mark_seen(deal.asin, deal.title, deal.price, deal.discount_percent, channel_name=channel_name)
     timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
 
-    clean_url = _strip_affiliate_tag(deal.url) if deal.url else f"https://www.amazon.eg/dp/{deal.asin}"
+    # Always the canonical Amazon product URL -- never the original
+    # channel's short/tracking link (see amazon.parser.normalize_product_url
+    # and listener.parser.extract_from_post, which now always sets deal.url
+    # this way once the ASIN has been resolved).
+    clean_url = deal.url
     pending_deals.store(deal.asin, deal.title, clean_url, deal.price, deal.discount_percent)
 
     price_history = database.get_latest_price_for_asin(deal.asin)

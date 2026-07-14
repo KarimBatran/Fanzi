@@ -35,7 +35,6 @@ def _manager() -> AIProviderManager:
 
 async def _get_verdict(manager: AIProviderManager):
     return await manager.get_verdict(
-        raw_text="test post",
         title="Test product",
         price=1000.0,
         discount_percent=30,

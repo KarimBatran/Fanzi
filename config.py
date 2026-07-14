@@ -97,3 +97,8 @@ REPLAY_FETCH_LIMIT = int(os.getenv("REPLAY_FETCH_LIMIT", "50"))
 # How often the reconnect watcher polls the Telethon client's connection
 # state to detect a disconnect -> reconnect transition.
 REPLAY_RECONNECT_POLL_SECONDS = float(os.getenv("REPLAY_RECONNECT_POLL_SECONDS", "10"))
+
+# Appended to every generated canonical product URL (amazon.parser.
+# normalize_product_url) when non-empty. Never taken from the source
+# channel's own link — only ever this configured tag.
+AMAZON_AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "")

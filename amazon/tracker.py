@@ -22,9 +22,26 @@ BACKOFF_SECONDS = (3, 7)  # delay before retry 1, retry 2 — modest pacing, not
 _PAGE_LOAD_TIMEOUT_MS = 20_000
 
 _TITLE_SELECTORS = ("#productTitle", "#title")
+# Price is read ONLY from the main buy-box / core-price containers, never a
+# bare page-wide `.a-price .a-offscreen`. amazon.eg renders sponsored-product
+# carousels and "compare with similar" widgets whose `.a-price .a-offscreen`
+# elements appear FIRST in the DOM and belong to entirely DIFFERENT ASINs
+# (verified live: the first match on a product with no buy box was a
+# `#sp_detail_<other-ASIN>` carousel card, rotating every page load — the
+# source of the "price keeps changing / doesn't match when I click" reports).
+# A tracked product with no buy box of its own (out of stock / no offer) has
+# no core-price container, so extraction correctly finds nothing and the
+# product is reported unavailable, instead of reporting a rotating ad's price
+# for some other product. The apex-pricetopay-value/priceToPay selectors come
+# first so a struck-through list/"was" price in the same container can never
+# win over the actual price to pay.
 _PRICE_SELECTORS = (
-    ".a-price .a-offscreen",
+    "#corePrice_feature_div .apex-pricetopay-value .a-offscreen",
+    "#corePrice_feature_div .priceToPay .a-offscreen",
     "#corePrice_feature_div .a-offscreen",
+    "#corePriceDisplay_desktop_feature_div .a-offscreen",
+    "#tp_price_block_total_price_ww .a-offscreen",
+    "#buybox .a-offscreen",
     "#priceblock_ourprice",
     "#priceblock_dealprice",
 )
@@ -108,8 +125,12 @@ async def _extract_first_text(page: Page, selectors: tuple[str, ...]) -> str | N
 
 async def _extract_price(page: Page) -> float | None:
     for selector in _PRICE_SELECTORS:
-        el = await page.query_selector(selector)
-        if el:
+        # query_selector_all, not query_selector: buy-box containers on
+        # amazon.eg often hold several `.a-offscreen` spans where the first
+        # is empty (e.g. an empty `.priceToPay .a-offscreen`); take the
+        # first one that actually parses to a price rather than the first
+        # element that merely exists.
+        for el in await page.query_selector_all(selector):
             price = _parse_price_text((await el.inner_text()).strip())
             if price is not None:
                 return price

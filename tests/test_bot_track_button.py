@@ -120,6 +120,35 @@ async def test_track_button_already_tracked_shows_message_not_duplicate():
 
 
 @pytest.mark.asyncio
+async def test_untrack_button_removes_the_product():
+    user = database.get_or_create_user(ADMIN_ID, "admin")
+    product = database.add_tracked_product(
+        user_id=user.id, asin="B0UNTRACK1", title="To remove",
+        url="https://www.amazon.eg/dp/B0UNTRACK1", current_price=100.0, target_price=90.0,
+    )
+    query = _FakeQuery(f"untrack:{product.id}")
+    await bot_module.untrack_pressed(_FakeUpdate(callback_query=query), _FakeContext())
+
+    assert database.get_tracked_product_by_asin(user.id, "B0UNTRACK1") is None
+    assert "removed" in query.message.replies[0][0].lower()
+
+
+@pytest.mark.asyncio
+async def test_untrack_button_only_removes_own_product():
+    owner = database.get_or_create_user(555, "owner")
+    product = database.add_tracked_product(
+        user_id=owner.id, asin="B0OWNED001", title="Owned",
+        url="https://www.amazon.eg/dp/B0OWNED001", current_price=100.0, target_price=90.0,
+    )
+    # A different user presses a stale button for someone else's product.
+    query = _FakeQuery(f"untrack:{product.id}")
+    await bot_module.untrack_pressed(_FakeUpdate(callback_query=query, user_id=ADMIN_ID), _FakeContext())
+
+    assert database.get_tracked_product_by_asin(owner.id, "B0OWNED001") is not None  # untouched
+    assert "no tracked product" in query.message.replies[0][0].lower()
+
+
+@pytest.mark.asyncio
 async def test_maybe_custom_target_received_ignores_unrelated_text():
     """Must not react to ordinary text when no Custom price prompt is
     outstanding — otherwise it would interfere with /track's own flow.

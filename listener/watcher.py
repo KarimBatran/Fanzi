@@ -549,7 +549,9 @@ async def add_channel_runtime(channel: str) -> tuple[bool, str]:
     if _client is None:
         return False, "Listener isn't running — check the logs."
 
-    channel = channel.lstrip("@").strip()
+    # Accepts @name / name / https://t.me/name / t.me/s/name (see
+    # channels_store.normalize_channel_input).
+    channel = channels_store.normalize_channel_input(channel)
     try:
         entity = await _client.get_entity(channel)
     except Exception:
@@ -573,7 +575,7 @@ async def remove_channel_runtime(channel: str) -> tuple[bool, str]:
     if _client is None:
         return False, "Listener isn't running — check the logs."
 
-    channel = channel.lstrip("@").strip()
+    channel = channels_store.normalize_channel_input(channel)
     channels_store.remove_channel(channel)
     await _resubscribe()
     logger.info("removechannel: stopped watching %s", channel)

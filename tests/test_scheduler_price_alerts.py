@@ -38,8 +38,46 @@ async def test_price_decrease_1000_to_999_notifies():
     with patch.object(scheduler, "fetch_product", new=AsyncMock(return_value=("Kenwood Sandwich Maker", 999.0))):
         await scheduler.run_check_cycle(bot)
     bot.send_message.assert_called_once()
-    assert "Price Update" in bot.send_message.call_args.kwargs["text"]
-    assert "-1 EGP" in bot.send_message.call_args.kwargs["text"]
+    text = bot.send_message.call_args.kwargs["text"]
+    assert "Price Update" in text
+    assert "-1 EGP" in text
+    assert "https://www.amazon.eg/dp/B0PRICEALERT" in text  # canonical URL now included
+
+
+@pytest.mark.asyncio
+async def test_price_update_unavailable_and_back_in_stock_all_include_url():
+    # Unavailable transition.
+    _make_product(1200.0, available=True)
+    bot = _fake_bot()
+    with patch.object(scheduler, "fetch_product", new=AsyncMock(side_effect=PriceNotFoundError("no price"))):
+        await scheduler.run_check_cycle(bot)
+    assert "https://www.amazon.eg/dp/B0PRICEALERT" in bot.send_message.call_args.kwargs["text"]
+
+    # Back-in-stock transition (now available again).
+    bot2 = _fake_bot()
+    with patch.object(scheduler, "fetch_product", new=AsyncMock(return_value=("Kenwood Sandwich Maker", 1200.0))):
+        await scheduler.run_check_cycle(bot2)
+    assert "https://www.amazon.eg/dp/B0PRICEALERT" in bot2.send_message.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_stored_title_refreshed_from_scraped_title():
+    """A product tracked with a raw channel-post title gets its title
+    replaced by the real scraped Amazon title on the next successful check,
+    and that cycle's own notification already uses the clean title.
+    """
+    pid = _make_product(1000.0)
+    # Overwrite the stored title with a raw channel-post-style line.
+    database.update_product_title(pid, "عرض على شاحن ... بسعر 3299ج")
+    bot = _fake_bot()
+    clean = "Anker Laptop Power Bank (25,000 mAh, 165W)"
+    with patch.object(scheduler, "fetch_product", new=AsyncMock(return_value=(clean, 999.0))):
+        await scheduler.run_check_cycle(bot)
+
+    refreshed = database.get_active_products(database.get_or_create_user(111, "tester").id)[0]
+    assert refreshed.title == clean  # persisted
+    assert clean in bot.send_message.call_args.kwargs["text"]  # used in this cycle's notification
+    assert "بسعر 3299ج" not in bot.send_message.call_args.kwargs["text"]
 
 
 @pytest.mark.asyncio

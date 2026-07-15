@@ -582,6 +582,19 @@ def mark_notified(product_id: int, price: float) -> None:
         )
 
 
+def update_product_title(product_id: int, title: str) -> None:
+    """Refreshes the stored title from the real scraped Amazon product title
+    (scheduler.py). Products tracked via the Track Price button start with
+    the raw channel-post first line (often with the price baked in, e.g.
+    '... بسعر 3299ج'); this replaces it with the clean product title once a
+    check cycle successfully fetches the page.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE tracked_products SET title = ? WHERE id = ?", (title, product_id)
+        )
+
+
 def remove_product(product_id: int, user_id: int) -> bool:
     """Deletes a product owned by user_id. Returns False if no matching row existed."""
     with get_connection() as conn:

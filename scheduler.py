@@ -47,12 +47,23 @@ PRICE_UPDATE_TEMPLATE = (
     "Product:\n{title}\n\n"
     "Previous:\n{previous_price} EGP\n\n"
     "Current:\n{current_price} EGP\n\n"
-    "Change:\n{change} EGP"
+    "Change:\n{change} EGP\n\n"
+    "https://www.amazon.eg/dp/{asin}"
 )
 
-UNAVAILABLE_TEMPLATE = "⚠️ Product Unavailable\n\nProduct:\n{title}\n\nThis item is no longer available or in stock."
+UNAVAILABLE_TEMPLATE = (
+    "⚠️ Product Unavailable\n\n"
+    "Product:\n{title}\n\n"
+    "This item is no longer available or in stock.\n\n"
+    "https://www.amazon.eg/dp/{asin}"
+)
 
-BACK_IN_STOCK_TEMPLATE = "✅ Back In Stock\n\nProduct:\n{title}\n\nCurrent:\n{current_price} EGP"
+BACK_IN_STOCK_TEMPLATE = (
+    "✅ Back In Stock\n\n"
+    "Product:\n{title}\n\n"
+    "Current:\n{current_price} EGP\n\n"
+    "https://www.amazon.eg/dp/{asin}"
+)
 
 
 async def run_check_cycle(bot: Bot) -> None:
@@ -83,8 +94,17 @@ async def run_check_cycle(bot: Bot) -> None:
         previous_notified_price = product.last_notified_price
 
         try:
-            _, current_price = await fetch_product(product.url)
+            scraped_title, current_price = await fetch_product(product.url)
             is_available = True
+            # Refresh the stored title from the real Amazon product title.
+            # Products auto-tracked / tracked via the Track Price button
+            # start with the raw channel-post first line (often with the
+            # price baked in, e.g. "... بسعر 3299ج"); replace it once we can.
+            # Update the in-memory object too so THIS cycle's notification
+            # already uses the clean title.
+            if scraped_title and scraped_title != product.title:
+                database.update_product_title(product.id, scraped_title)
+                product.title = scraped_title
         except PriceNotFoundError:
             # Page loaded (title present) but no price element found --
             # treated as the product being unavailable/out of stock, not a
@@ -142,10 +162,10 @@ async def _maybe_send_price_change_alert(
 
     if is_available and not previous_available:
         text = BACK_IN_STOCK_TEMPLATE.format(
-            title=product.title or product.asin, current_price=format_price(current_price)
+            title=product.title or product.asin, current_price=format_price(current_price), asin=product.asin
         )
     elif not is_available and previous_available:
-        text = UNAVAILABLE_TEMPLATE.format(title=product.title or product.asin)
+        text = UNAVAILABLE_TEMPLATE.format(title=product.title or product.asin, asin=product.asin)
     elif is_available and previous_available and previous_price is not None and current_price != previous_price:
         change = current_price - previous_price
         text = PRICE_UPDATE_TEMPLATE.format(
@@ -153,6 +173,7 @@ async def _maybe_send_price_change_alert(
             previous_price=format_price(previous_price),
             current_price=format_price(current_price),
             change=f"{'+' if change > 0 else ''}{format_price(change)}",
+            asin=product.asin,
         )
     else:
         return  # identical price, or still unavailable both times — no notification

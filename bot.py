@@ -292,6 +292,7 @@ async def mytracks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     lines = []
+    buttons = []
     for p in products:
         title = p.title or "(title not fetched yet)"
         price = f"{format_price(p.current_price)} {p.currency}" if p.current_price is not None else "not fetched yet"
@@ -299,8 +300,35 @@ async def mytracks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"#{p.id} — {p.asin}\n{title}\n"
             f"Current: {price} | Target: {format_price(p.target_price)} {p.currency}"
         )
+        # One tap removes the item — no need to type /remove <id>. Button
+        # label carries a short title so a long list stays scannable.
+        short = (p.title or p.asin)[:30]
+        buttons.append(
+            [InlineKeyboardButton(f"🗑 Remove #{p.id} — {short}", callback_data=f"untrack:{p.id}")]
+        )
 
-    await update.message.reply_text("\n\n".join(lines))
+    await update.message.reply_text(
+        "\n\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def untrack_pressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for the 🗑 Remove button on a /mytracks item — one-tap removal
+    with no typed command. Only removes a product owned by the presser, so a
+    stale button from someone else's list can't delete another user's item.
+    """
+    query = update.callback_query
+    await query.answer()
+    try:
+        product_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return
+
+    user = database.get_or_create_user(update.effective_user.id, update.effective_user.username)
+    if database.remove_product(product_id, user.id):
+        await query.message.reply_text(f"🗑 Removed #{product_id} from tracking.")
+    else:
+        await query.message.reply_text(f"No tracked product #{product_id} found for you.")
 
 
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -593,6 +621,7 @@ def build_application() -> Application:
     # track_button_pressed for why (deals forward continuously, so more than
     # one Track Price flow can be mid-flight for the same admin at once).
     application.add_handler(CallbackQueryHandler(track_button_pressed, pattern=r"^track:"))
+    application.add_handler(CallbackQueryHandler(untrack_pressed, pattern=r"^untrack:\d+$"))
     application.add_handler(CallbackQueryHandler(target_percentage_chosen, pattern=r"^target:[^:]+:(10|20|25)$"))
     application.add_handler(CallbackQueryHandler(target_custom_prompt, pattern=r"^target:[^:]+:custom$"))
     application.add_handler(CallbackQueryHandler(target_cancelled, pattern=r"^target:[^:]+:cancel$"))

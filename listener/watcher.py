@@ -249,6 +249,15 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
     clean_url = deal.url
     pending_deals.store(deal.asin, deal.title, clean_url, deal.price, deal.discount_percent)
 
+    # Append-only price history for listener/scoring.py -- the
+    # deal-forwarding half of price_observations (the tracked-product half
+    # is written by database.update_price_check). Recorded here, after the
+    # family pre_check, so the observation carries its family_id.
+    database.record_price_observation(
+        deal.asin, family_decision.family_id, deal.price, deal.discount_percent,
+        datetime.now().isoformat(),
+    )
+
     price_history = database.get_latest_price_for_asin(deal.asin)
 
     # Daily AI budget manager (listener/budget.py) priority signals: a

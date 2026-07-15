@@ -330,12 +330,57 @@ CREATE TABLE IF NOT EXISTS family_ai_decisions (
 -- Daily AI-call priority-tier counters (listener/budget.py) -- how many
 -- incoming deals were classified Priority 1/2/3 today, for /status'
 -- Budget section and for estimating deals/hour.
+-- shadow_total/shadow_divergences (listener/scoring.py shadow mode) count
+-- how many deals had both the legacy and scored classifiers evaluated
+-- side-by-side today, and how many of those disagreed -- the /status
+-- divergence-rate signal used to validate the score engine before
+-- SCORE_ENGINE_ENABLED is ever flipped on.
 CREATE TABLE IF NOT EXISTS priority_stats (
     stat_date TEXT PRIMARY KEY,
     priority_1 INTEGER NOT NULL DEFAULT 0,
     priority_2 INTEGER NOT NULL DEFAULT 0,
-    priority_3 INTEGER NOT NULL DEFAULT 0
+    priority_3 INTEGER NOT NULL DEFAULT 0,
+    shadow_total INTEGER NOT NULL DEFAULT 0,
+    shadow_divergences INTEGER NOT NULL DEFAULT 0
 );
+
+-- Deterministic brand-reputation scores (listener/scoring.py). One row per
+-- brand ever seen in `verdicts`, holding a decay-weighted mean of that
+-- brand's historical AI verdict qualities (skip=0.0, average=1/3, good=2/3,
+-- great=1.0), using the same monthly-decay style as listener/learning.py's
+-- _update_rule. Fully recomputed from `verdicts` by
+-- backfill_brand_reputation() -- idempotent, safe to re-run any time, and
+-- re-run on every init_db() so it never goes stale between deploys.
+CREATE TABLE IF NOT EXISTS brand_reputation (
+    brand TEXT PRIMARY KEY,
+    decayed_quality_mean REAL NOT NULL,
+    decayed_weight REAL NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    last_updated TIMESTAMP NOT NULL
+);
+
+-- Append-only price history feeding listener/scoring.py's historical price
+-- percentile. One row per observed (asin, price) sighting -- written from
+-- both the deal-forwarding path (listener/watcher.py, right after Product
+-- Family pre_check so family_id is known) and the tracked-product path
+-- (update_price_check below). Never updated in place. family_id is TEXT
+-- (matching product_families.family_id, e.g. "fam_<hex>"), NULL when the
+-- observation has no family context (tracked-product checks).
+CREATE TABLE IF NOT EXISTS price_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asin TEXT NOT NULL,
+    family_id TEXT,
+    price REAL NOT NULL,
+    discount_percent REAL,
+    observed_at TIMESTAMP NOT NULL
+);
+
+-- Covering indexes (asin/family_id + price) so listener/scoring.py's
+-- MIN/MAX/COUNT aggregates are answered entirely from the index, never
+-- touching table rows -- this is what keeps the per-deal Value Score cost
+-- effectively free (benchmarked: 1,000 scores well under 50 ms).
+CREATE INDEX IF NOT EXISTS idx_price_observations_asin ON price_observations(asin, price);
+CREATE INDEX IF NOT EXISTS idx_price_observations_family ON price_observations(family_id, price);
 """
 
 
@@ -399,6 +444,22 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE product_families ADD COLUMN {column} {coltype}")
             except sqlite3.OperationalError:
                 pass
+
+        # Migration for priority_stats rows created before score-engine
+        # shadow mode existed (listener/scoring.py) -- additive columns
+        # only, same swallow-duplicate-column pattern as above.
+        for column in ("shadow_total", "shadow_divergences"):
+            try:
+                conn.execute(
+                    f"ALTER TABLE priority_stats ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+    # Recomputed from `verdicts` on every startup -- idempotent full
+    # rebuild, so brand reputation never drifts stale between deploys and
+    # re-running init_db (tests do this constantly) is always safe.
+    backfill_brand_reputation()
 
 
 def get_or_create_user(telegram_id: int, username: str | None) -> User:
@@ -495,6 +556,22 @@ def update_price_check(product_id: int, current_price: float | None, available: 
             "UPDATE tracked_products SET current_price = ?, available = ?, last_checked = datetime('now') WHERE id = ?",
             (current_price, 1 if available else 0, product_id),
         )
+        # Append-only price history for listener/scoring.py -- the
+        # tracked-product half of price_observations (the deal-forwarding
+        # half is written in listener/watcher.py). No family context here;
+        # no row at all when the product was unavailable (price is None).
+        if current_price is not None:
+            row = conn.execute(
+                "SELECT asin FROM tracked_products WHERE id = ?", (product_id,)
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """
+                    INSERT INTO price_observations (asin, family_id, price, discount_percent, observed_at)
+                    VALUES (?, NULL, ?, NULL, datetime('now'))
+                    """,
+                    (row["asin"], current_price),
+                )
 
 
 def mark_notified(product_id: int, price: float) -> None:
@@ -1482,6 +1559,174 @@ def get_alltime_ai_calls_used() -> int:
         gemini = conn.execute("SELECT COALESCE(SUM(call_count), 0) AS n FROM gemini_quota").fetchone()["n"]
         groq = conn.execute("SELECT COALESCE(SUM(call_count), 0) AS n FROM groq_quota").fetchone()["n"]
         return gemini + groq
+
+
+# --- Value Score engine (listener/scoring.py) -----------------------------
+
+# Same quality scale everywhere in scoring: worst 0.0 .. best 1.0.
+_QUALITY_VALUE = {"skip": 0.0, "average": 1 / 3, "good": 2 / 3, "great": 1.0}
+
+_SCORING_SECONDS_PER_MONTH = 30.44 * 86400  # matches listener/learning.py
+
+
+# Bumped every time backfill_brand_reputation rewrites the table -- the
+# only way brand_reputation ever changes. listener/scoring.py compares this
+# against the generation it cached at, so its in-memory copy of the (small)
+# table invalidates exactly when the data does, with no import cycle.
+brand_reputation_generation = 0
+
+
+def backfill_brand_reputation(now: "datetime | None" = None) -> int:
+    """Full, idempotent rebuild of brand_reputation from `verdicts`, using
+    the same monthly-decay style as listener/learning.py's _update_rule:
+    each verdict contributes weight RULE_MONTHLY_DECAY ** months_elapsed.
+    DELETE + re-insert, so running it twice (or two hundred times) always
+    converges to the identical rows -- never duplicates. Returns the number
+    of brands written.
+    """
+    from datetime import datetime as _datetime
+
+    from config import RULE_MONTHLY_DECAY
+
+    now = now or _datetime.now()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT brand, deal_quality, timestamp FROM verdicts WHERE brand IS NOT NULL"
+        ).fetchall()
+
+        totals: dict[str, list[float]] = {}  # brand -> [weighted_quality_sum, weight_sum, count]
+        for row in rows:
+            quality_value = _QUALITY_VALUE.get(row["deal_quality"])
+            if quality_value is None:
+                continue
+            try:
+                verdict_at = _datetime.fromisoformat(row["timestamp"])
+            except ValueError:
+                continue
+            elapsed_months = max(0.0, (now - verdict_at).total_seconds() / _SCORING_SECONDS_PER_MONTH)
+            weight = RULE_MONTHLY_DECAY ** elapsed_months
+            entry = totals.setdefault(row["brand"], [0.0, 0.0, 0])
+            entry[0] += weight * quality_value
+            entry[1] += weight
+            entry[2] += 1
+
+        conn.execute("DELETE FROM brand_reputation")
+        for brand, (weighted_sum, weight_sum, count) in totals.items():
+            if weight_sum <= 0:
+                continue
+            conn.execute(
+                """
+                INSERT INTO brand_reputation (brand, decayed_quality_mean, decayed_weight, sample_count, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (brand, weighted_sum / weight_sum, weight_sum, count, now.isoformat()),
+            )
+
+    global brand_reputation_generation
+    brand_reputation_generation += 1
+    return len(totals)
+
+
+def get_brand_reputation(brand: str, conn: sqlite3.Connection | None = None) -> sqlite3.Row | None:
+    if conn is not None:
+        return conn.execute(
+            "SELECT * FROM brand_reputation WHERE brand = ?", (brand,)
+        ).fetchone()
+    with get_connection() as owned:
+        return owned.execute(
+            "SELECT * FROM brand_reputation WHERE brand = ?", (brand,)
+        ).fetchone()
+
+
+def record_price_observation(
+    asin: str, family_id: str | None, price: float, discount_percent: float | None, observed_at: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO price_observations (asin, family_id, price, discount_percent, observed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (asin, family_id, price, discount_percent, observed_at),
+        )
+
+
+# n only ever feeds saturating threshold checks in listener/scoring.py
+# (rarity saturation, "fewer than two points has no spread") -- never exact
+# arithmetic -- so family counting stops at this cap instead of scanning a
+# dense family's entire history on every score.
+_OBSERVATION_COUNT_CAP = 20
+
+_ASIN_OBSERVATION_STATS_SQL = (
+    "SELECT MIN(price) AS min_price, MAX(price) AS max_price, COUNT(*) AS n "
+    "FROM price_observations WHERE asin = ?"
+)
+# The family branch deliberately uses three tiny statements instead of one
+# MIN/MAX/COUNT aggregate: with the covering (family_id, price) index,
+# standalone MIN and MAX are each a single index seek, while a combined
+# aggregate must scan every entry for the COUNT and loses that optimization
+# -- measured several times slower per call on a dense family. (The asin
+# branch keeps the single aggregate: one ASIN's history is small enough
+# that a single short scan beats three round-trips.)
+_FAMILY_MIN_SQL = "SELECT MIN(price) AS v FROM price_observations WHERE family_id = ?"
+_FAMILY_MAX_SQL = "SELECT MAX(price) AS v FROM price_observations WHERE family_id = ?"
+_FAMILY_COUNT_CAPPED_SQL = (
+    "SELECT COUNT(*) AS n FROM (SELECT 1 FROM price_observations WHERE family_id = ? LIMIT ?)"
+)
+
+
+def get_price_observation_stats(
+    asin: str, family_id: str | None, conn: sqlite3.Connection | None = None,
+) -> dict:
+    """MIN/MAX/COUNT over this ASIN's own observations plus (when a family
+    is known) every sibling ASIN's observations, all via the covering
+    (asin, price)/(family_id, price) indexes -- an `asin = ? OR family_id
+    = ?` form would defeat both. A row carrying both this asin and this
+    family_id counts twice in n, and the family count saturates at
+    _OBSERVATION_COUNT_CAP -- both harmless for n's threshold-only use.
+    """
+    def _query(c: sqlite3.Connection) -> dict:
+        asin_row = c.execute(_ASIN_OBSERVATION_STATS_SQL, (asin,)).fetchone()
+        min_price, max_price = asin_row["min_price"], asin_row["max_price"]
+        n = asin_row["n"] or 0
+        if family_id is not None:
+            f_min = c.execute(_FAMILY_MIN_SQL, (family_id,)).fetchone()["v"]
+            f_max = c.execute(_FAMILY_MAX_SQL, (family_id,)).fetchone()["v"]
+            n += c.execute(_FAMILY_COUNT_CAPPED_SQL, (family_id, _OBSERVATION_COUNT_CAP)).fetchone()["n"]
+            if f_min is not None and (min_price is None or f_min < min_price):
+                min_price = f_min
+            if f_max is not None and (max_price is None or f_max > max_price):
+                max_price = f_max
+        return {"min_price": min_price, "max_price": max_price, "n": n}
+
+    if conn is not None:
+        return _query(conn)
+    with get_connection() as owned:
+        return _query(owned)
+
+
+def record_shadow_comparison(stat_date: str, diverged: bool) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO priority_stats (stat_date, shadow_total, shadow_divergences) VALUES (?, 1, ?)
+            ON CONFLICT(stat_date) DO UPDATE SET
+                shadow_total = shadow_total + 1,
+                shadow_divergences = shadow_divergences + excluded.shadow_divergences
+            """,
+            (stat_date, 1 if diverged else 0),
+        )
+
+
+def get_shadow_stats(stat_date: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT shadow_total, shadow_divergences FROM priority_stats WHERE stat_date = ?",
+            (stat_date,),
+        ).fetchone()
+    if row is None:
+        return {"shadow_total": 0, "shadow_divergences": 0}
+    return {"shadow_total": row["shadow_total"], "shadow_divergences": row["shadow_divergences"]}
 
 
 def get_learned_brands_and_categories() -> tuple[set[str], set[str]]:

@@ -44,6 +44,20 @@ def block_real_ai_providers(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_scoring_caches():
+    """listener.scoring caches the brand_reputation table (generation-
+    invalidated) and category rules (TTL) in module state — both would
+    otherwise leak across tests, since every test gets a fresh database
+    but the module-level caches survive.
+    """
+    from listener import scoring
+
+    scoring.clear_caches()
+    yield
+    scoring.clear_caches()
+
+
+@pytest.fixture(autouse=True)
 def isolated_redirect_cache():
     """listener.parser caches resolved redirects across calls (short TTL, by
     design, in production) — several tests reuse the same URL expecting

@@ -162,3 +162,22 @@ FAMILY_VERDICT_DISCOUNT_CHANGE_THRESHOLD_PERCENT = float(
 SMART_SAMPLING_VARIANT_THRESHOLD = int(os.getenv("SMART_SAMPLING_VARIANT_THRESHOLD", "10"))
 SMART_SAMPLING_EVERY_N_VARIANTS = int(os.getenv("SMART_SAMPLING_EVERY_N_VARIANTS", "10"))
 SMART_SAMPLING_INTERVAL_HOURS = float(os.getenv("SMART_SAMPLING_INTERVAL_HOURS", "6"))
+
+# Value Score engine (listener/scoring.py + listener/budget.py). When
+# SCORE_ENGINE_ENABLED is false (the shipping default), priority
+# classification behaves byte-for-byte identically to before this engine
+# existed (classify_priority_legacy); the score engine still runs in shadow
+# mode -- computing and logging what it *would* have decided -- whenever
+# SCORE_ENGINE_LOG_VERBOSE is true, so it can be validated against real
+# traffic before ever being flipped on. See docs/score_engine_rollout.md.
+SCORE_ENGINE_ENABLED = os.getenv("SCORE_ENGINE_ENABLED", "false").lower() == "true"
+SCORE_ENGINE_LOG_VERBOSE = os.getenv("SCORE_ENGINE_LOG_VERBOSE", "true").lower() == "true"
+# Component weights for the combined 0-100 Value Score -- must sum to 1.0
+# (validated at import in listener/scoring.py). rarity = how little price
+# history exists for this ASIN/family (a rarely-seen product is worth a
+# fresh look more than one observed dozens of times).
+SCORE_WEIGHT_BRAND = float(os.getenv("SCORE_WEIGHT_BRAND", "0.25"))
+SCORE_WEIGHT_PRICE_PCTL = float(os.getenv("SCORE_WEIGHT_PRICE_PCTL", "0.25"))
+SCORE_WEIGHT_FAMILY_PCTL = float(os.getenv("SCORE_WEIGHT_FAMILY_PCTL", "0.15"))
+SCORE_WEIGHT_CATEGORY_DEV = float(os.getenv("SCORE_WEIGHT_CATEGORY_DEV", "0.15"))
+SCORE_WEIGHT_RARITY = float(os.getenv("SCORE_WEIGHT_RARITY", "0.20"))

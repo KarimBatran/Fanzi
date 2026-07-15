@@ -32,7 +32,17 @@ from config import (
     PRIORITY2_DISCOUNT_THRESHOLD,
     PRIORITY3_HEALTHY_BUDGET_MULTIPLIER,
     PRIORITY3_RULE_CONFIDENCE_CEILING,
+    SCORE_ENGINE_ENABLED,
 )
+
+# Value Score -> priority tier cut points for classify_priority_scored().
+# A score at/above SCORE_PRIORITY1_THRESHOLD is Priority 1, at/above
+# SCORE_PRIORITY2_THRESHOLD is Priority 2, else Priority 3. Chosen so a
+# fully-neutral deal (every component 0.5 -> score 50) lands in Priority 2
+# ("analyze if budget allows"), matching the legacy classifier's own
+# middle-ground treatment of an unremarkable deal.
+SCORE_PRIORITY1_THRESHOLD = 65.0
+SCORE_PRIORITY2_THRESHOLD = 40.0
 
 
 def _today() -> str:
@@ -62,6 +72,12 @@ class BudgetSnapshot:
     priority_1_count: int
     priority_2_count: int
     priority_3_count: int
+    # Score-engine shadow mode (listener/scoring.py): how many deals today
+    # had both classifiers evaluated side-by-side, and what fraction
+    # disagreed -- the pre-flip validation signal shown in /status.
+    shadow_total: int = 0
+    shadow_divergences: int = 0
+    shadow_divergence_rate: float | None = None
 
 
 def _calls_used_today(stat_date: str) -> int:
@@ -78,6 +94,7 @@ def get_snapshot(now: datetime | None = None) -> BudgetSnapshot:
 
     calls_saved_today = database.get_learning_stats(stat_date)["ai_calls_saved"]
     priority_counts = database.get_priority_counts(stat_date)
+    shadow_stats = database.get_shadow_stats(stat_date)
     deals_seen_today = sum(priority_counts.values())
 
     deals_per_hour = deals_seen_today / hours_elapsed
@@ -110,6 +127,13 @@ def get_snapshot(now: datetime | None = None) -> BudgetSnapshot:
         projected_exhaustion=projected_exhaustion,
         priority_1_count=priority_counts[1], priority_2_count=priority_counts[2],
         priority_3_count=priority_counts[3],
+        shadow_total=shadow_stats["shadow_total"],
+        shadow_divergences=shadow_stats["shadow_divergences"],
+        shadow_divergence_rate=(
+            shadow_stats["shadow_divergences"] / shadow_stats["shadow_total"]
+            if shadow_stats["shadow_total"] > 0
+            else None
+        ),
     )
 
 
@@ -123,7 +147,7 @@ def _budget_health(remaining: int, reserve_floor: int) -> float:
     return min((remaining - reserve_floor) / (healthy_at - reserve_floor), 1.0) if healthy_at > reserve_floor else 1.0
 
 
-def classify_priority(
+def classify_priority_legacy(
     *,
     discount_percent: int | None,
     is_new_family: bool,
@@ -132,7 +156,11 @@ def classify_priority(
     is_new_lowest_family_price: bool,
     rule_confidence: float | None,
 ) -> int:
-    """Priority 1 ("always analyze"): high discount, a genuinely new family/
+    """The original heuristic classifier, preserved verbatim (only renamed
+    from classify_priority) -- the SCORE_ENGINE_ENABLED=false path must be
+    byte-for-byte identical to pre-score-engine production behavior.
+
+    Priority 1 ("always analyze"): high discount, a genuinely new family/
     brand/category, a variant that's now the cheapest in its family, or a
     learned rule too unconfident to trust at all. Priority 2 ("analyze if
     budget allows"): moderate discount or moderate rule confidence.
@@ -156,6 +184,77 @@ def classify_priority(
         return 2
 
     return 3
+
+
+def classify_priority_scored(
+    *,
+    discount_percent: int | None,
+    asin: str = "",
+    brand: str | None = None,
+    category: str | None = None,
+    price: float = 0.0,
+    family_id: str | None = None,
+    score_result=None,
+) -> int:
+    """Value-Score-driven classifier (listener/scoring.py). The outlier
+    safety check in listener/learning.py takes precedence over any score:
+    an outlier deal is always Priority 1, exactly as learning.decide()
+    itself would force a real AI call for it regardless of any rule.
+
+    `score_result` (a scoring.ValueScoreResult) can be passed by callers
+    that already computed the score (listener/analyzer.py computes it once
+    for shadow logging) so it's never computed twice per deal.
+    """
+    from listener import learning, scoring
+
+    if learning.is_outlier(brand, category, price, discount_percent):
+        return 1
+
+    if score_result is None:
+        score_result = scoring.compute_value_score(
+            asin=asin, brand=brand, category=category, price=price,
+            discount_percent=discount_percent, family_id=family_id,
+        )
+
+    if score_result.total >= SCORE_PRIORITY1_THRESHOLD:
+        return 1
+    if score_result.total >= SCORE_PRIORITY2_THRESHOLD:
+        return 2
+    return 3
+
+
+def classify_priority(
+    *,
+    discount_percent: int | None,
+    is_new_family: bool,
+    is_unknown_brand: bool,
+    is_new_category: bool,
+    is_new_lowest_family_price: bool,
+    rule_confidence: float | None,
+    asin: str = "",
+    brand: str | None = None,
+    category: str | None = None,
+    price: float = 0.0,
+    family_id: str | None = None,
+    score_result=None,
+) -> int:
+    """The single dispatch point between the legacy heuristic and the Value
+    Score engine -- the only branch on SCORE_ENGINE_ENABLED in the entire
+    codebase. The extra keyword args (asin/brand/category/price/family_id/
+    score_result) are consumed only by the scored path; the legacy path
+    ignores them entirely, so with the flag off, behavior is identical to
+    calling classify_priority_legacy directly.
+    """
+    if SCORE_ENGINE_ENABLED:
+        return classify_priority_scored(
+            discount_percent=discount_percent, asin=asin, brand=brand, category=category,
+            price=price, family_id=family_id, score_result=score_result,
+        )
+    return classify_priority_legacy(
+        discount_percent=discount_percent, is_new_family=is_new_family,
+        is_unknown_brand=is_unknown_brand, is_new_category=is_new_category,
+        is_new_lowest_family_price=is_new_lowest_family_price, rule_confidence=rule_confidence,
+    )
 
 
 def should_spend_ai_call(priority: int, snapshot: BudgetSnapshot) -> bool:

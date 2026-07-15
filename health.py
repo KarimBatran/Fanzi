@@ -208,6 +208,12 @@ def _format_budget_section(b) -> list[str]:
         f"Priority 1 today: {b.priority_1_count}",
         f"Priority 2 today: {b.priority_2_count}",
         f"Priority 3 today: {b.priority_3_count}",
+        (
+            f"Score engine shadow divergence: {b.shadow_divergence_rate:.0%} "
+            f"({b.shadow_divergences}/{b.shadow_total} deals)"
+            if b.shadow_divergence_rate is not None
+            else "Score engine shadow divergence: no data yet"
+        ),
     ]
 
 

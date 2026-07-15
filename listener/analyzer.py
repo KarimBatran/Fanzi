@@ -8,20 +8,80 @@ informational field callers are free to ignore).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import database
-from config import MIN_DISCOUNT_FOR_ANALYSIS
-from listener import budget, family, learning
+from config import MIN_DISCOUNT_FOR_ANALYSIS, SCORE_ENGINE_ENABLED, SCORE_ENGINE_LOG_VERBOSE
+from listener import budget, family, learning, scoring
 from listener.ai_providers import get_manager
 from listener.parser import ParsedDeal
 
 logger = logging.getLogger("fanzi.listener.analyzer")
 
 _QUALITY_RANK = {"skip": 0, "average": 1, "good": 2, "great": 3}
+
+# Keeps fire-and-forget shadow-log tasks alive until done (same pattern as
+# listener/learning.py's _background_tasks) -- asyncio only holds weak refs.
+_shadow_tasks: set[asyncio.Task] = set()
+
+
+def _log_shadow_score(
+    legacy_kwargs: dict, scored_kwargs: dict, discount_percent: int | None,
+    score_result, stat_date: str,
+) -> None:
+    """Computes and logs the legacy vs scored priority side-by-side for one
+    deal (structured, single line) and records the divergence counter --
+    this is the shadow-mode signal reviewed before SCORE_ENGINE_ENABLED is
+    ever flipped (docs/score_engine_rollout.md). Pure SQLite reads + one
+    counter write; never raises into the pipeline.
+    """
+    try:
+        if score_result is None:
+            score_result = scoring.compute_value_score(
+                discount_percent=discount_percent, **scored_kwargs
+            )
+        legacy_priority = budget.classify_priority_legacy(
+            discount_percent=discount_percent, **legacy_kwargs
+        )
+        scored_priority = budget.classify_priority_scored(
+            discount_percent=discount_percent, score_result=score_result, **scored_kwargs
+        )
+        family_pctl = (
+            f"{score_result.family_percentile:.2f}" if score_result.family_percentile is not None else "none"
+        )
+        logger.info(
+            "score_shadow asin=%s brand=%s category=%s legacy_priority=%d scored_priority=%d "
+            "value_score=%.1f brand_reputation=%.2f price_percentile=%.2f family_percentile=%s "
+            "category_deviation=%.2f rarity=%.2f",
+            scored_kwargs["asin"], scored_kwargs["brand"], scored_kwargs["category"],
+            legacy_priority, scored_priority, score_result.total,
+            score_result.brand_reputation, score_result.price_percentile, family_pctl,
+            score_result.category_deviation, score_result.rarity,
+        )
+        database.record_shadow_comparison(stat_date, diverged=legacy_priority != scored_priority)
+    except Exception:
+        logger.exception("shadow score logging failed -- pipeline unaffected")
+
+
+def _spawn_shadow_score_log(
+    legacy_kwargs: dict, scored_kwargs: dict, discount_percent: int | None,
+    score_result, stat_date: str,
+) -> None:
+    """Fire-and-forget, same pattern as learning.spawn_learning_task -- the
+    shadow computation runs after the current message's forward path yields,
+    never inside it.
+    """
+
+    async def _run() -> None:
+        _log_shadow_score(legacy_kwargs, scored_kwargs, discount_percent, score_result, stat_date)
+
+    task = asyncio.create_task(_run())
+    _shadow_tasks.add(task)
+    task.add_done_callback(_shadow_tasks.discard)
 
 
 @dataclass
@@ -106,15 +166,37 @@ async def _analyze_deal(
     if timing:
         timing.record("rule_lookup", (time.monotonic() - rule_lookup_start) * 1000)
 
-    priority = budget.classify_priority(
-        discount_percent=deal.discount_percent,
+    legacy_kwargs = dict(
         is_new_family=is_new_family,
         is_unknown_brand=brand is None,
         is_new_category=guessed_category is None,
         is_new_lowest_family_price=is_new_family_low_price,
         rule_confidence=decision.rule.confidence if decision.rule is not None else None,
     )
+    scored_kwargs = dict(
+        asin=deal.asin, brand=brand, category=guessed_category,
+        price=deal.price, family_id=family_id,
+    )
+    # Computed synchronously only when the scored classifier is actually
+    # deciding priority; in shadow-only mode (flag off, verbose on) the
+    # score is computed inside the fire-and-forget shadow task instead, so
+    # the live forward path pays nothing for it.
+    score_result = (
+        scoring.compute_value_score(discount_percent=deal.discount_percent, **scored_kwargs)
+        if SCORE_ENGINE_ENABLED
+        else None
+    )
+
+    priority = budget.classify_priority(
+        discount_percent=deal.discount_percent, score_result=score_result,
+        **legacy_kwargs, **scored_kwargs,
+    )
     database.record_priority_classification(stat_date, priority)
+
+    if SCORE_ENGINE_LOG_VERBOSE:
+        _spawn_shadow_score_log(
+            legacy_kwargs, scored_kwargs, deal.discount_percent, score_result, stat_date
+        )
 
     if decision.kind == "rule" and priority == 1:
         # Priority 1 ("always analyze") overrides a matched rule -- a

@@ -102,3 +102,19 @@ REPLAY_RECONNECT_POLL_SECONDS = float(os.getenv("REPLAY_RECONNECT_POLL_SECONDS",
 # normalize_product_url) when non-empty. Never taken from the source
 # channel's own link — only ever this configured tag.
 AMAZON_AFFILIATE_TAG = os.getenv("AMAZON_AFFILIATE_TAG", "")
+
+# Product Family detection (listener/family.py) — matches related Amazon
+# ASINs (color/size/capacity/pack variants) so the bot can tell "same family,
+# same variant" (suppress) apart from "same family, genuinely better/other
+# variant" (still notify). FUZZY_MATCH_THRESHOLD: normalized-title similarity
+# at or above this is treated as the same family without ever asking AI.
+# AI_MATCH_FLOOR: below this, treated as a different family without asking
+# AI either — AI is only consulted in the ambiguous band between the two.
+FAMILY_FUZZY_MATCH_THRESHOLD = float(os.getenv("FAMILY_FUZZY_MATCH_THRESHOLD", "0.82"))
+FAMILY_AI_MATCH_FLOOR = float(os.getenv("FAMILY_AI_MATCH_FLOOR", "0.55"))
+# True-duplicate suppression tolerance: a repost of the same family + same
+# variant attributes is only ever suppressed if price/discount are also
+# within these tolerances (and within DUPLICATE_WINDOW_HOURS) — otherwise
+# it's a genuine price/discount change worth notifying about.
+FAMILY_DUPLICATE_PRICE_TOLERANCE_EGP = float(os.getenv("FAMILY_DUPLICATE_PRICE_TOLERANCE_EGP", "1.0"))
+FAMILY_DUPLICATE_DISCOUNT_TOLERANCE_PERCENT = int(os.getenv("FAMILY_DUPLICATE_DISCOUNT_TOLERANCE_PERCENT", "2"))

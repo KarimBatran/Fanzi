@@ -241,6 +241,73 @@ CREATE TABLE IF NOT EXISTS replay_stats (
     stat_date TEXT PRIMARY KEY,
     recovered_count INTEGER NOT NULL DEFAULT 0
 );
+
+-- Product Family detection (listener/family.py). One row per detected
+-- family of related Amazon ASINs (color/size/capacity/pack variants of the
+-- same underlying product). normalized_title has all recognized variant
+-- tokens stripped, so different colors of the same product share it.
+-- deterministic_key is a hash of (brand, normalized_title, category) --
+-- the fast-path exact-match signal. anchor_asin is the first ASIN that
+-- created this family, used as the stable "other half" of the
+-- (asin, anchor_asin) pair key for permanently caching AI similarity
+-- decisions (family_ai_decisions below). lowest_price/highest_discount_
+-- percent/best_verdict_quality/best_variant_label/best_variant_asin track
+-- the best variant seen so far, updated every time a member's numbers beat
+-- them -- this is what "Better Variant Found" vs "New Variant Available"
+-- is decided against.
+CREATE TABLE IF NOT EXISTS product_families (
+    family_id TEXT PRIMARY KEY,
+    brand TEXT,
+    normalized_title TEXT NOT NULL,
+    category TEXT,
+    deterministic_key TEXT NOT NULL,
+    anchor_asin TEXT NOT NULL,
+    lowest_price REAL,
+    highest_discount_percent INTEGER,
+    best_verdict_quality TEXT,
+    best_variant_label TEXT,
+    best_variant_asin TEXT,
+    variant_count INTEGER NOT NULL DEFAULT 0,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_product_families_key ON product_families(deterministic_key);
+CREATE INDEX IF NOT EXISTS idx_product_families_brand_category ON product_families(brand, category);
+
+-- One row per ASIN ever assigned to a family -- variant_json holds the
+-- structured attributes extracted from that ASIN's own title (e.g.
+-- {"color": "Red", "size": "42"}), never removed from the stored title
+-- itself. last_price/last_discount_percent/last_seen_at are this specific
+-- ASIN's own last-seen numbers (as opposed to product_families' family-wide
+-- best), used to detect a true same-variant repost (see family.py's
+-- duplicate-suppression check, which compares against the most recent
+-- member sharing the same variant_json, not necessarily this exact ASIN).
+CREATE TABLE IF NOT EXISTS family_members (
+    asin TEXT PRIMARY KEY,
+    family_id TEXT NOT NULL REFERENCES product_families(family_id),
+    variant_json TEXT NOT NULL DEFAULT '{}',
+    last_price REAL,
+    last_discount_percent INTEGER,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_family_members_family ON family_members(family_id);
+
+-- Permanent cache of AI family-similarity decisions, keyed by the
+-- (asin_a, asin_b) pair with asin_a < asin_b (sorted, so lookup order never
+-- matters) -- once asked about a specific pair of ASINs, family.py never
+-- asks AI about that exact pair again, regardless of outcome (true or
+-- false answers are both cached).
+CREATE TABLE IF NOT EXISTS family_ai_decisions (
+    asin_a TEXT NOT NULL,
+    asin_b TEXT NOT NULL,
+    same_family INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    reason TEXT,
+    decided_at TEXT NOT NULL,
+    PRIMARY KEY (asin_a, asin_b)
+);
 """
 
 
@@ -1122,3 +1189,182 @@ def _row_to_product(row: sqlite3.Row) -> TrackedProduct:
         available=bool(row["available"]),
         created_at=row["created_at"],
     )
+
+
+# --- Product Family detection (listener/family.py) -----------------------
+
+
+def get_family_member(asin: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM family_members WHERE asin = ?", (asin,)
+        ).fetchone()
+
+
+def get_product_family(family_id: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM product_families WHERE family_id = ?", (family_id,)
+        ).fetchone()
+
+
+def get_family_by_deterministic_key(deterministic_key: str) -> sqlite3.Row | None:
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM product_families WHERE deterministic_key = ?", (deterministic_key,)
+        ).fetchone()
+
+
+def get_families_by_brand_category(brand: str | None, category: str | None) -> list[sqlite3.Row]:
+    """Candidate families for fuzzy/AI title-similarity matching -- narrowed
+    to the same brand and category (NULL-safe equality) since brand/category
+    are required matching signals, never skipped in favor of title alone.
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM product_families
+            WHERE brand IS ? AND category IS ?
+            """,
+            (brand, category),
+        ).fetchall()
+
+
+def create_product_family(
+    family_id: str,
+    brand: str | None,
+    normalized_title: str,
+    category: str | None,
+    deterministic_key: str,
+    anchor_asin: str,
+    lowest_price: float | None,
+    highest_discount_percent: int | None,
+    first_seen: str,
+    last_seen: str,
+    best_variant_label: str | None = None,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO product_families (
+                family_id, brand, normalized_title, category, deterministic_key,
+                anchor_asin, lowest_price, highest_discount_percent,
+                best_variant_label, best_variant_asin, variant_count, first_seen, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                family_id, brand, normalized_title, category, deterministic_key,
+                anchor_asin, lowest_price, highest_discount_percent, best_variant_label, anchor_asin,
+                first_seen, last_seen,
+            ),
+        )
+
+
+def upsert_family_member(
+    asin: str, family_id: str, variant_json: str,
+    price: float | None, discount_percent: int | None, seen_at: str,
+) -> bool:
+    """Returns True the first time this ASIN is recorded in family_members
+    (a brand-new distinct member), False on a subsequent update to an
+    already-known member -- callers use this to decide whether to bump
+    product_families.variant_count.
+    """
+    with get_connection() as conn:
+        is_new = conn.execute(
+            "SELECT 1 FROM family_members WHERE asin = ?", (asin,)
+        ).fetchone() is None
+        conn.execute(
+            """
+            INSERT INTO family_members (asin, family_id, variant_json, last_price, last_discount_percent, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asin) DO UPDATE SET
+                variant_json = excluded.variant_json,
+                last_price = excluded.last_price,
+                last_discount_percent = excluded.last_discount_percent,
+                last_seen_at = excluded.last_seen_at
+            """,
+            (asin, family_id, variant_json, price, discount_percent, seen_at),
+        )
+        if is_new:
+            conn.execute(
+                "UPDATE product_families SET variant_count = variant_count + 1 WHERE family_id = ?",
+                (family_id,),
+            )
+        return is_new
+
+
+def get_family_member_by_variant(family_id: str, variant_json: str) -> sqlite3.Row | None:
+    """Most recently seen member of this family with the exact same variant
+    signature -- used for true-duplicate suppression (see family.py). Not
+    necessarily the same ASIN: a different reseller listing of the identical
+    color/size still counts.
+    """
+    with get_connection() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM family_members
+            WHERE family_id = ? AND variant_json = ?
+            ORDER BY last_seen_at DESC LIMIT 1
+            """,
+            (family_id, variant_json),
+        ).fetchone()
+
+
+def touch_product_family(family_id: str, seen_at: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE product_families SET last_seen = ? WHERE family_id = ?", (seen_at, family_id)
+        )
+
+
+def update_product_family_aggregates(
+    family_id: str,
+    lowest_price: float | None,
+    highest_discount_percent: int | None,
+    best_verdict_quality: str | None,
+    best_variant_label: str | None,
+    best_variant_asin: str | None,
+    last_seen: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE product_families SET
+                lowest_price = ?, highest_discount_percent = ?, best_verdict_quality = ?,
+                best_variant_label = ?, best_variant_asin = ?, last_seen = ?
+            WHERE family_id = ?
+            """,
+            (
+                lowest_price, highest_discount_percent, best_verdict_quality,
+                best_variant_label, best_variant_asin, last_seen, family_id,
+            ),
+        )
+
+
+def get_family_ai_decision(asin_a: str, asin_b: str) -> sqlite3.Row | None:
+    a, b = sorted((asin_a, asin_b))
+    with get_connection() as conn:
+        return conn.execute(
+            "SELECT * FROM family_ai_decisions WHERE asin_a = ? AND asin_b = ?", (a, b)
+        ).fetchone()
+
+
+def store_family_ai_decision(
+    asin_a: str, asin_b: str, same_family: bool, confidence: float, reason: str, decided_at: str,
+) -> None:
+    a, b = sorted((asin_a, asin_b))
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO family_ai_decisions (asin_a, asin_b, same_family, confidence, reason, decided_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asin_a, asin_b) DO NOTHING
+            """,
+            (a, b, int(same_family), confidence, reason, decided_at),
+        )
+
+
+def count_product_families() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM product_families").fetchone()
+        return row["n"]

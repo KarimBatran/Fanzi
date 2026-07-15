@@ -287,14 +287,14 @@ class GeminiProvider:
     def record_call(self) -> None:
         database.increment_gemini_quota_count(_today())
 
-    async def generate(self, user_content: str, *, strict: bool = False) -> str:
+    async def generate(self, user_content: str, *, strict: bool = False, system_prompt: str | None = None) -> str:
         client = self._get_client()
         try:
             response = await client.aio.models.generate_content(
                 model=self._MODEL,
                 contents=user_content,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=_STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT,
+                    system_instruction=system_prompt or (_STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT),
                     response_mime_type="application/json",
                     max_output_tokens=256,
                     # Extended thinking just burns quota/tokens for this
@@ -344,7 +344,7 @@ class GroqProvider:
     def record_call(self) -> None:
         database.increment_groq_quota_count(_today())
 
-    async def generate(self, user_content: str, *, strict: bool = False) -> str:
+    async def generate(self, user_content: str, *, strict: bool = False, system_prompt: str | None = None) -> str:
         client = self._get_client()
         try:
             response = await client.chat.completions.create(
@@ -352,7 +352,7 @@ class GroqProvider:
                 max_tokens=256,
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": _STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt or (_STRICT_SYSTEM_PROMPT if strict else _SYSTEM_PROMPT)},
                     {"role": "user", "content": user_content},
                 ],
             )

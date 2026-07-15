@@ -46,9 +46,10 @@ from config import (
     TELETHON_API_ID,
     TELETHON_SESSION_NAME,
 )
-from listener import channels_store, dedup, pending_deals, replay
+from listener import channels_store, dedup, family, learning, pending_deals, replay
 from listener.ai_providers import get_manager
 from listener.analyzer import DealVerdict, analyze_deal, meets_min_quality
+from listener.family import FamilyDecision
 from listener.parser import ParseDiagnostics, ParsedDeal, extract_from_post
 from listener.timing import DealTiming
 
@@ -107,6 +108,55 @@ def _build_message_for_verdict(deal: ParsedDeal, verdict: DealVerdict | None, cl
         return _format_message(deal, verdict.reason, clean_url, verdict_is_explanation=True)
     emoji = _QUALITY_EMOJI.get(verdict.deal_quality, "🤷")
     return _format_message(deal, f"{emoji} {verdict.reason}", clean_url)
+
+
+_BETTER_VARIANT_TEMPLATE = (
+    "🔥 Better Variant Found\n\n"
+    "{title}\n\n"
+    "Variant:\n{variant_label}\n\n"
+    "Current:\n{price:g} EGP\n\n"
+    "Previous family best:\n{previous_price:g} EGP ({previous_label})\n\n"
+    "Savings:\n{savings:g} EGP\n\n"
+    "This is now the cheapest variant in the family.\n\n"
+    "{url}"
+)
+
+_NEW_VARIANT_TEMPLATE = (
+    "🎨 New Variant Available\n\n"
+    "{title}\n\n"
+    "Variant:\n{variant_label}\n\n"
+    "Price:\n{price:g} EGP\n\n"
+    "Current family best:\n{best_label} ({best_price:g} EGP)\n\n"
+    "{url}"
+)
+
+
+def _build_message_for_family_variant(deal: ParsedDeal, clean_url: str, decision: FamilyDecision) -> str:
+    """Only ever called for the "better_variant"/"new_variant" outcomes of
+    listener.family.finalize() -- a brand-new family still uses the normal
+    _build_message_for_verdict() path, unaffected by Product Family logic.
+    """
+    label = family.variant_label(decision.variant)
+    if decision.notify_kind == "better_variant":
+        previous_price = decision.previous_best_price if decision.previous_best_price is not None else deal.price
+        return _BETTER_VARIANT_TEMPLATE.format(
+            title=deal.title,
+            variant_label=label,
+            price=deal.price,
+            previous_price=previous_price,
+            previous_label=decision.previous_best_label or "previous variant",
+            savings=decision.savings if decision.savings is not None else 0.0,
+            url=clean_url,
+        )
+    best_price = decision.previous_best_price if decision.previous_best_price is not None else deal.price
+    return _NEW_VARIANT_TEMPLATE.format(
+        title=deal.title,
+        variant_label=label,
+        price=deal.price,
+        best_label=decision.previous_best_label or label,
+        best_price=best_price,
+        url=clean_url,
+    )
 
 
 async def _handle_post(
@@ -171,6 +221,27 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
     dedup.mark_seen(deal.asin, deal.title, deal.price, deal.discount_percent, channel_name=channel_name)
     timing.record("dedup", (time.perf_counter() - dedup_start) * 1000)
 
+    # Product Family detection: recognizes color/size/capacity/pack variants
+    # of the same underlying product as related, not automatically
+    # duplicates (see listener/family.py). Runs *before* the deal-quality AI
+    # call so a true same-variant repost never costs an AI request.
+    brand = learning.extract_brand(deal.title)
+    guessed_category = learning.guess_category(deal.title)
+    family_start = time.perf_counter()
+    family_decision = await family.pre_check(
+        deal.asin, deal.title, deal.price, deal.discount_percent, brand, guessed_category
+    )
+    timing.record("family", (time.perf_counter() - family_start) * 1000)
+
+    if family_decision.notify_kind == "duplicate":
+        logger.info(
+            "[%s] true family-variant duplicate skipped (%s, family=%s)",
+            channel_name, deal.asin, family_decision.family_id,
+        )
+        health.record_duplicate_skipped()
+        database.record_channel_duplicate(channel_name, stat_date)
+        return
+
     # Always the canonical Amazon product URL -- never the original
     # channel's short/tracking link (see amazon.parser.normalize_product_url
     # and listener.parser.extract_from_post, which now always sets deal.url
@@ -182,7 +253,7 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
 
     if not AI_SOFT_TIMEOUT_ENABLED:
         verdict = await analyze_deal(deal, price_history, timing=timing)
-        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date)
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date, family_decision)
         return
 
     analysis_task = asyncio.create_task(analyze_deal(deal, price_history, timing=timing))
@@ -190,7 +261,7 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
 
     if analysis_task in done:
         verdict = analysis_task.result()
-        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date)
+        await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date, family_decision)
         return
 
     # AI hasn't answered within the soft timeout — user experience over
@@ -211,7 +282,8 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
 
     asyncio.create_task(
         _finish_analysis_in_background(
-            bot, analysis_task, deal, clean_url, channel_name, stat_date, message.chat_id, message.message_id
+            bot, analysis_task, deal, clean_url, channel_name, stat_date, message.chat_id, message.message_id,
+            family_decision,
         )
     )
 
@@ -225,7 +297,7 @@ def _record_verdict_stats(verdict: DealVerdict, channel_name: str, stat_date: st
 
 async def _forward_verdict(
     bot: Bot, deal: ParsedDeal, verdict: DealVerdict | None, clean_url: str, channel_name: str,
-    timing: DealTiming, stat_date: str,
+    timing: DealTiming, stat_date: str, family_decision: FamilyDecision,
 ) -> None:
     """Shared by both the normal (AI answered in time) and soft-timeout
     (AI answered late, called from the immediate path when it happens to
@@ -239,12 +311,31 @@ async def _forward_verdict(
         )
         health.record_deal_analyzed()
         _record_verdict_stats(verdict, channel_name, stat_date)
+
+    # A brand-new family behaves exactly as before this feature existed --
+    # standard message, standard MIN_DEAL_QUALITY filter. An existing
+    # family's variant is finalized only now (a verdict, or None, is known)
+    # and is never subject to the quality filter: "New Variant Available"/
+    # "Better Variant Found" are informational about family state, not a
+    # deal-quality judgment, and price/discount alone can already justify
+    # notifying regardless of what the AI verdict says (see family.py).
+    final_decision = family_decision
+    if family_decision.notify_kind == "pending":
+        final_decision = family.finalize(
+            family_decision.family_id, deal.asin, family_decision.variant,
+            deal.price, deal.discount_percent, verdict.deal_quality if verdict is not None else None,
+        )
+
+    if final_decision.notify_kind == "new_family" and verdict is not None:
         if not meets_min_quality(verdict.deal_quality, MIN_DEAL_QUALITY):
             logger.info("[%s] Filtered out (%s) — skipping", channel_name, verdict.deal_quality)
             timing.log_summary()
             return
 
-    message_text = _build_message_for_verdict(deal, verdict, clean_url)
+    if final_decision.notify_kind in ("better_variant", "new_variant"):
+        message_text = _build_message_for_family_variant(deal, clean_url, final_decision)
+    else:
+        message_text = _build_message_for_verdict(deal, verdict, clean_url)
     send_start = time.perf_counter()
     await bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=message_text, reply_markup=_track_button(deal.asin))
     timing.record("telegram_send", (time.perf_counter() - send_start) * 1000)
@@ -257,7 +348,7 @@ async def _forward_verdict(
 
 async def _finish_analysis_in_background(
     bot: Bot, analysis_task: asyncio.Task, deal: ParsedDeal, clean_url: str, channel_name: str, stat_date: str,
-    chat_id: int, message_id: int,
+    chat_id: int, message_id: int, family_decision: FamilyDecision,
 ) -> None:
     """Awaits the AI analysis that outran the soft timeout, then edits the
     already-forwarded placeholder message in place with the real verdict.
@@ -279,10 +370,21 @@ async def _finish_analysis_in_background(
 
     health.record_deal_analyzed()
     _record_verdict_stats(verdict, channel_name, stat_date)
+
+    final_decision = family_decision
+    if family_decision.notify_kind == "pending":
+        final_decision = family.finalize(
+            family_decision.family_id, deal.asin, family_decision.variant,
+            deal.price, deal.discount_percent, verdict.deal_quality,
+        )
+
     # Already forwarded via the placeholder — the deal is visible either way,
     # so a low-quality verdict still gets an honest edit rather than leaving
     # "analyzing..." stuck forever (that's reserved for the AI-failed case).
-    new_text = _build_message_for_verdict(deal, verdict, clean_url)
+    if final_decision.notify_kind in ("better_variant", "new_variant"):
+        new_text = _build_message_for_family_variant(deal, clean_url, final_decision)
+    else:
+        new_text = _build_message_for_verdict(deal, verdict, clean_url)
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text)
         database.record_channel_forwarded(channel_name, stat_date)

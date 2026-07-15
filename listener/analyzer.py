@@ -15,7 +15,7 @@ from datetime import date, datetime
 
 import database
 from config import MIN_DISCOUNT_FOR_ANALYSIS
-from listener import learning
+from listener import budget, family, learning
 from listener.ai_providers import get_manager
 from listener.parser import ParsedDeal
 
@@ -39,6 +39,8 @@ def meets_min_quality(deal_quality: str, min_quality: str) -> bool:
 
 async def analyze_deal(
     deal: ParsedDeal, price_history: float | None, *, timing=None,
+    family_id: str | None = None, variant: dict | None = None,
+    is_new_family: bool = False, is_new_family_low_price: bool = False,
 ) -> DealVerdict | None:
     """Returns a DealVerdict, or None if analysis couldn't be completed by
     either provider — callers fall back to forwarding the raw deal with an
@@ -54,15 +56,30 @@ async def analyze_deal(
     stage durations for the per-deal timing summary — the required
     (deal, price_history) positional signature and return value are
     unchanged, so this is purely additive instrumentation.
+
+    `family_id`/`variant`/`is_new_family`/`is_new_family_low_price`
+    (listener/family.py, all optional/keyword-only, default to "no family
+    context" for every existing caller/test) feed the daily AI budget
+    manager (listener/budget.py): priority classification and the
+    family-verdict cache. See that module's docstring for the full
+    learned-rule -> family-cache -> Gemini -> Groq -> budget-skip order.
     """
     start = time.monotonic()
     try:
-        return await _analyze_deal(deal, price_history, timing=timing)
+        return await _analyze_deal(
+            deal, price_history, timing=timing, family_id=family_id, variant=variant or {},
+            is_new_family=is_new_family, is_new_family_low_price=is_new_family_low_price,
+        )
     finally:
         logger.debug("End-to-end analysis duration: %.0f ms", (time.monotonic() - start) * 1000)
 
 
-async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing=None) -> DealVerdict | None:
+async def _analyze_deal(
+    deal: ParsedDeal, price_history: float | None, *, timing=None,
+    family_id: str | None = None, variant: dict | None = None,
+    is_new_family: bool = False, is_new_family_low_price: bool = False,
+) -> DealVerdict | None:
+    variant = variant or {}
     if deal.price is None or deal.price <= 0:
         logger.info("skipped analysis (no price)")
         return None
@@ -80,10 +97,30 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing
     rule_lookup_start = time.monotonic()
     brand = learning.extract_brand(deal.title)
     guessed_category = learning.guess_category(deal.title)
-    decision = learning.decide(brand, guessed_category, deal.price, deal.discount_percent)
+    stat_date = date.today().isoformat()
+    snapshot = budget.get_snapshot()
+    decision = learning.decide(
+        brand, guessed_category, deal.price, deal.discount_percent,
+        validation_multiplier=snapshot.validation_multiplier,
+    )
     if timing:
         timing.record("rule_lookup", (time.monotonic() - rule_lookup_start) * 1000)
-    stat_date = date.today().isoformat()
+
+    priority = budget.classify_priority(
+        discount_percent=deal.discount_percent,
+        is_new_family=is_new_family,
+        is_unknown_brand=brand is None,
+        is_new_category=guessed_category is None,
+        is_new_lowest_family_price=is_new_family_low_price,
+        rule_confidence=decision.rule.confidence if decision.rule is not None else None,
+    )
+    database.record_priority_classification(stat_date, priority)
+
+    if decision.kind == "rule" and priority == 1:
+        # Priority 1 ("always analyze") overrides a matched rule -- a
+        # high-discount / brand-new-family / newly-cheapest deal is always
+        # worth a fresh, real look rather than trusting a rule silently.
+        decision = learning.Decision("ai", None, had_candidate=True)
 
     if decision.kind == "rule":
         database.record_rule_hit(stat_date)
@@ -100,6 +137,38 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing
             suggested_target=int(deal.price * target_multiplier),
             category=guessed_category or "other",
             provider="learned",
+        )
+
+    # Tier 2 (listener/budget.py's provider order): a cached family verdict.
+    # Not gated on priority -- priority only decides whether to *spend* a
+    # real AI call below; reusing an already-valid cached verdict is free,
+    # and family.get_cached_verdict() has its own strict invalidation rules
+    # (price/discount moved, new family-wide low/high, unseen variant
+    # attribute, smart sampling) that already reject the cache for exactly
+    # the situations that would otherwise force Priority 1 here (e.g. "new
+    # lowest family price" invalidates the cache on its own).
+    if decision.kind == "ai" and family_id is not None:
+        cached = family.get_cached_verdict(family_id, deal.price, deal.discount_percent, variant)
+        if cached is not None:
+            database.record_ai_call_saved(stat_date)
+            logger.info("family verdict cache hit (family=%s) — AI call saved", family_id)
+            return DealVerdict(
+                deal_quality=cached.deal_quality, reason=cached.reason,
+                suggested_target=cached.suggested_target, category=cached.category,
+                provider="family_cache",
+            )
+
+    if decision.kind == "ai" and priority != 1 and not budget.should_spend_ai_call(priority, snapshot):
+        logger.info(
+            "budget gate: priority %d deal skipped (remaining=%d/%d) — synthetic verdict",
+            priority, snapshot.remaining, snapshot.daily_budget,
+        )
+        return DealVerdict(
+            deal_quality="average",
+            reason=f"Priority {priority} deal skipped under today's AI budget ({snapshot.remaining}/{snapshot.daily_budget} left) — not sent to an AI provider.",
+            suggested_target=int(deal.price * 0.97),
+            category=guessed_category or "other",
+            provider="budget_skip",
         )
 
     if decision.kind == "validate":
@@ -124,6 +193,9 @@ async def _analyze_deal(deal: ParsedDeal, price_history: float | None, *, timing
     )
     if verdict is None:
         return None
+
+    if family_id is not None:
+        family.record_verdict(family_id, verdict, deal.price, deal.discount_percent, variant)
 
     if decision.kind == "validate":
         now = datetime.now()

@@ -251,12 +251,25 @@ async def _process_post(bot: Bot, text: str, channel_name: str, stat_date: str, 
 
     price_history = database.get_latest_price_for_asin(deal.asin)
 
+    # Daily AI budget manager (listener/budget.py) priority signals: a
+    # brand-new family is always Priority 1, and "cheaper than every
+    # previous variant" is known immediately from pre_check's own price
+    # comparison, without waiting for a verdict.
+    is_new_family = family_decision.notify_kind == "new_family"
+    is_new_family_low_price = is_new_family or (
+        family_decision.previous_best_price is None or deal.price < family_decision.previous_best_price
+    )
+    analyze_kwargs = dict(
+        family_id=family_decision.family_id, variant=family_decision.variant,
+        is_new_family=is_new_family, is_new_family_low_price=is_new_family_low_price,
+    )
+
     if not AI_SOFT_TIMEOUT_ENABLED:
-        verdict = await analyze_deal(deal, price_history, timing=timing)
+        verdict = await analyze_deal(deal, price_history, timing=timing, **analyze_kwargs)
         await _forward_verdict(bot, deal, verdict, clean_url, channel_name, timing, stat_date, family_decision)
         return
 
-    analysis_task = asyncio.create_task(analyze_deal(deal, price_history, timing=timing))
+    analysis_task = asyncio.create_task(analyze_deal(deal, price_history, timing=timing, **analyze_kwargs))
     done, _pending = await asyncio.wait({analysis_task}, timeout=AI_SOFT_TIMEOUT_SECONDS)
 
     if analysis_task in done:

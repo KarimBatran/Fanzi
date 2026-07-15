@@ -230,7 +230,19 @@ class Decision:
     had_candidate: bool  # whether any rule row existed at all (for rule_miss stats)
 
 
-def decide(brand: str | None, category: str | None, price: float, discount_percent: int | None) -> Decision:
+def decide(
+    brand: str | None, category: str | None, price: float, discount_percent: int | None,
+    *, validation_multiplier: float = 1.0,
+) -> Decision:
+    """`validation_multiplier` (listener/budget.py, keyword-only, defaults to
+    1.0 = unchanged behavior for every existing caller) scales the
+    probability of validating an already-confident rule with a real AI call.
+    Values below 1.0 mean "trust rules more readily" -- how the daily AI
+    budget manager reduces AI demand as the budget tightens, without ever
+    touching the < 0.70 confidence band (below that, a fresh AI call is
+    still always used -- the pattern isn't trusted enough yet regardless of
+    budget).
+    """
     if is_outlier(brand, category, price, discount_percent):
         return Decision("ai", None, had_candidate=False)
 
@@ -244,7 +256,7 @@ def decide(brand: str | None, category: str | None, price: float, discount_perce
         ai_probability = _confidence_band_ai_probability(match.confidence)
         if ai_probability is None:
             continue
-        if random.random() < ai_probability:
+        if random.random() < ai_probability * validation_multiplier:
             return Decision("validate", match, had_candidate=True)
         return Decision("rule", match, had_candidate=True)
 

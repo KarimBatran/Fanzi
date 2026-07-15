@@ -255,6 +255,15 @@ CREATE TABLE IF NOT EXISTS replay_stats (
 -- the best variant seen so far, updated every time a member's numbers beat
 -- them -- this is what "Better Variant Found" vs "New Variant Available"
 -- is decided against.
+-- last_verdict_* columns (listener/family.py's AI-verdict cache, added
+-- alongside listener/budget.py) hold the most recent REAL (non-cached,
+-- non-rule) AI verdict obtained for any member of this family, so a new
+-- variant arriving within FAMILY_VERDICT_CACHE_WINDOW_HOURS can reuse it
+-- (provider="family_cache") instead of spending another AI call, unless
+-- price/discount moved significantly or a genuinely new variant-attribute
+-- kind appeared (last_verdict_variant_keys, a JSON list of attribute keys
+-- e.g. ["color"] seen at cache time, compared against the new variant's
+-- own keys).
 CREATE TABLE IF NOT EXISTS product_families (
     family_id TEXT PRIMARY KEY,
     brand TEXT,
@@ -269,7 +278,16 @@ CREATE TABLE IF NOT EXISTS product_families (
     best_variant_asin TEXT,
     variant_count INTEGER NOT NULL DEFAULT 0,
     first_seen TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    last_verdict_quality TEXT,
+    last_verdict_reason TEXT,
+    last_verdict_suggested_target INTEGER,
+    last_verdict_category TEXT,
+    last_verdict_provider TEXT,
+    last_verdict_at TEXT,
+    last_verdict_price REAL,
+    last_verdict_discount_percent INTEGER,
+    last_verdict_variant_keys TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_product_families_key ON product_families(deterministic_key);
@@ -307,6 +325,16 @@ CREATE TABLE IF NOT EXISTS family_ai_decisions (
     reason TEXT,
     decided_at TEXT NOT NULL,
     PRIMARY KEY (asin_a, asin_b)
+);
+
+-- Daily AI-call priority-tier counters (listener/budget.py) -- how many
+-- incoming deals were classified Priority 1/2/3 today, for /status'
+-- Budget section and for estimating deals/hour.
+CREATE TABLE IF NOT EXISTS priority_stats (
+    stat_date TEXT PRIMARY KEY,
+    priority_1 INTEGER NOT NULL DEFAULT 0,
+    priority_2 INTEGER NOT NULL DEFAULT 0,
+    priority_3 INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -349,6 +377,28 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tracked_products ADD COLUMN available INTEGER NOT NULL DEFAULT 1")
         except sqlite3.OperationalError:
             pass
+
+        # Migration for product_families rows created before the AI-verdict
+        # cache (listener/family.py + listener/budget.py) existed -- adds
+        # each last_verdict_* column individually since SQLite has no
+        # multi-column ALTER TABLE ADD COLUMN. Existing rows get NULL,
+        # which get_cached_verdict() already treats as "no cached verdict
+        # yet" (falls through to a real AI call), so no backfill is needed.
+        for column, coltype in (
+            ("last_verdict_quality", "TEXT"),
+            ("last_verdict_reason", "TEXT"),
+            ("last_verdict_suggested_target", "INTEGER"),
+            ("last_verdict_category", "TEXT"),
+            ("last_verdict_provider", "TEXT"),
+            ("last_verdict_at", "TEXT"),
+            ("last_verdict_price", "REAL"),
+            ("last_verdict_discount_percent", "INTEGER"),
+            ("last_verdict_variant_keys", "TEXT"),
+        ):
+            try:
+                conn.execute(f"ALTER TABLE product_families ADD COLUMN {column} {coltype}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def get_or_create_user(telegram_id: int, username: str | None) -> User:
@@ -1368,3 +1418,92 @@ def count_product_families() -> int:
     with get_connection() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM product_families").fetchone()
         return row["n"]
+
+
+def record_family_verdict(
+    family_id: str,
+    quality: str,
+    reason: str,
+    suggested_target: int,
+    category: str,
+    provider: str,
+    price: float,
+    discount_percent: int | None,
+    variant_keys_json: str,
+    decided_at: str,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE product_families SET
+                last_verdict_quality = ?, last_verdict_reason = ?, last_verdict_suggested_target = ?,
+                last_verdict_category = ?, last_verdict_provider = ?, last_verdict_at = ?,
+                last_verdict_price = ?, last_verdict_discount_percent = ?, last_verdict_variant_keys = ?
+            WHERE family_id = ?
+            """,
+            (
+                quality, reason, suggested_target, category, provider, decided_at,
+                price, discount_percent, variant_keys_json, family_id,
+            ),
+        )
+
+
+# --- Daily AI budget manager (listener/budget.py) -------------------------
+
+
+def record_priority_classification(stat_date: str, priority: int) -> None:
+    column = {1: "priority_1", 2: "priority_2", 3: "priority_3"}[priority]
+    with get_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO priority_stats (stat_date, {column}) VALUES (?, 1)
+            ON CONFLICT(stat_date) DO UPDATE SET {column} = {column} + 1
+            """,
+            (stat_date,),
+        )
+
+
+def get_priority_counts(stat_date: str) -> dict:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM priority_stats WHERE stat_date = ?", (stat_date,)).fetchone()
+    if row is None:
+        return {1: 0, 2: 0, 3: 0}
+    return {1: row["priority_1"], 2: row["priority_2"], 3: row["priority_3"]}
+
+
+def get_alltime_calls_saved() -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(ai_calls_saved), 0) AS n FROM learning_stats").fetchone()
+        return row["n"]
+
+
+def get_alltime_ai_calls_used() -> int:
+    with get_connection() as conn:
+        gemini = conn.execute("SELECT COALESCE(SUM(call_count), 0) AS n FROM gemini_quota").fetchone()["n"]
+        groq = conn.execute("SELECT COALESCE(SUM(call_count), 0) AS n FROM groq_quota").fetchone()["n"]
+        return gemini + groq
+
+
+def get_learned_brands_and_categories() -> tuple[set[str], set[str]]:
+    """Distinct brand/category names with at least one enabled learned rule
+    -- parsed from learned_rules.key, whose shape depends on rule_type (see
+    listener/learning.py's module docstring for the four key formats).
+    """
+    brands: set[str] = set()
+    categories: set[str] = set()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT rule_type, key FROM learned_rules WHERE enabled = 1"
+        ).fetchall()
+    for row in rows:
+        rule_type, key = row["rule_type"], row["key"]
+        if rule_type == "brand":
+            brands.add(key)
+        elif rule_type == "brand_category":
+            brand, _, category = key.partition("|")
+            brands.add(brand)
+            categories.add(category)
+        elif rule_type in ("category_price", "category_discount"):
+            category, _, _bucket = key.partition("|")
+            categories.add(category)
+    return brands, categories

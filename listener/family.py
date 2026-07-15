@@ -43,8 +43,14 @@ from config import (
     FAMILY_DUPLICATE_DISCOUNT_TOLERANCE_PERCENT,
     FAMILY_DUPLICATE_PRICE_TOLERANCE_EGP,
     FAMILY_FUZZY_MATCH_THRESHOLD,
+    FAMILY_VERDICT_CACHE_WINDOW_HOURS,
+    FAMILY_VERDICT_DISCOUNT_CHANGE_THRESHOLD_PERCENT,
+    FAMILY_VERDICT_PRICE_CHANGE_THRESHOLD_PERCENT,
+    SMART_SAMPLING_EVERY_N_VARIANTS,
+    SMART_SAMPLING_INTERVAL_HOURS,
+    SMART_SAMPLING_VARIANT_THRESHOLD,
 )
-from listener.ai_providers import _extract_json_object, get_manager
+from listener.ai_providers import AIVerdict, _extract_json_object, get_manager
 
 logger = logging.getLogger("fanzi.listener.family")
 
@@ -389,4 +395,91 @@ def finalize(
         matched_via="", confidence=1.0,
         previous_best_price=previous_lowest_price, previous_best_label=previous_best_label,
         savings=savings,
+    )
+
+
+# ---- AI-verdict cache (listener/budget.py's "cached family verdict" tier) -
+
+def _smart_sampling_forces_fresh_call(family, last_verdict_at: datetime) -> bool:
+    """A well-learned family (enough known variants) still gets a real AI
+    call periodically -- either every SMART_SAMPLING_EVERY_N_VARIANTS-th
+    distinct variant, or after SMART_SAMPLING_INTERVAL_HOURS since the last
+    real verdict, whichever comes first -- to detect market drift instead
+    of trusting a cached verdict forever.
+    """
+    variant_count = family["variant_count"]
+    if variant_count < SMART_SAMPLING_VARIANT_THRESHOLD:
+        return False
+    if variant_count % SMART_SAMPLING_EVERY_N_VARIANTS == 0:
+        return True
+    return datetime.now() - last_verdict_at >= timedelta(hours=SMART_SAMPLING_INTERVAL_HOURS)
+
+
+def get_cached_verdict(family_id: str, price: float, discount_percent: int | None, variant: dict) -> AIVerdict | None:
+    """Reuses the family's last REAL AI verdict for a new variant instead of
+    spending another AI call -- unless price/discount moved significantly,
+    this is a new family-wide lowest price/highest discount (always worth a
+    fresh look), a genuinely new kind of variant attribute appeared, or
+    smart sampling says this occurrence must be a real call. Returns None
+    (never guesses) whenever any of these apply, or when no real verdict has
+    ever been cached for this family yet.
+    """
+    family = database.get_product_family(family_id)
+    if family is None or family["last_verdict_quality"] is None or family["last_verdict_at"] is None:
+        return None
+
+    last_verdict_at = datetime.fromisoformat(family["last_verdict_at"])
+    if datetime.now() - last_verdict_at >= timedelta(hours=FAMILY_VERDICT_CACHE_WINDOW_HOURS):
+        return None
+
+    last_price = family["last_verdict_price"]
+    if last_price:
+        price_change_pct = abs(price - last_price) / last_price * 100
+        if price_change_pct > FAMILY_VERDICT_PRICE_CHANGE_THRESHOLD_PERCENT:
+            return None
+
+    last_discount = family["last_verdict_discount_percent"]
+    if (discount_percent is None) != (last_discount is None):
+        return None
+    if (
+        discount_percent is not None
+        and last_discount is not None
+        and abs(discount_percent - last_discount) > FAMILY_VERDICT_DISCOUNT_CHANGE_THRESHOLD_PERCENT
+    ):
+        return None
+
+    if family["lowest_price"] is not None and price < family["lowest_price"]:
+        return None
+    if discount_percent is not None and (
+        family["highest_discount_percent"] is None or discount_percent > family["highest_discount_percent"]
+    ):
+        return None
+
+    cached_keys = set(json.loads(family["last_verdict_variant_keys"] or "[]"))
+    if not set(variant.keys()) <= cached_keys:
+        return None
+
+    if _smart_sampling_forces_fresh_call(family, last_verdict_at):
+        return None
+
+    return AIVerdict(
+        provider="family_cache",
+        deal_quality=family["last_verdict_quality"],
+        reason=family["last_verdict_reason"],
+        suggested_target=family["last_verdict_suggested_target"],
+        category=family["last_verdict_category"],
+    )
+
+
+def record_verdict(family_id: str, verdict: AIVerdict, price: float, discount_percent: int | None, variant: dict) -> None:
+    """Caches a REAL (Gemini/Groq) verdict for future get_cached_verdict()
+    calls. Callers must never pass a verdict whose own provider is already
+    "family_cache"/"learned"/"budget_skip" -- that would let a non-AI
+    verdict silently perpetuate itself as if it were a fresh AI opinion.
+    """
+    database.record_family_verdict(
+        family_id=family_id, quality=verdict.deal_quality, reason=verdict.reason,
+        suggested_target=verdict.suggested_target, category=verdict.category, provider=verdict.provider,
+        price=price, discount_percent=discount_percent,
+        variant_keys_json=json.dumps(sorted(variant.keys())), decided_at=datetime.now().isoformat(),
     )

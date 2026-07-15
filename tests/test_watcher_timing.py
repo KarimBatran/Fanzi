@@ -153,7 +153,7 @@ async def test_slow_request_triggers_warning_log(caplog, monkeypatch):
         deal_quality="great", reason="x", suggested_target=450, category="other", provider="gemini"
     )
 
-    async def _analyze_slower_than_threshold(deal, price_history, *, timing=None):
+    async def _analyze_slower_than_threshold(deal, price_history, *, timing=None, **_kwargs):
         await asyncio.sleep(0.05)
         return fast_verdict
 

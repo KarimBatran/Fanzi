@@ -13,7 +13,7 @@ from datetime import date, datetime
 
 import database
 from config import CHECK_INTERVAL_MINUTES
-from listener import channels_store, dedup, learning, replay, watchdog
+from listener import budget, channels_store, dedup, learning, replay, watchdog
 from listener.ai_providers import get_manager
 
 # A channel showing this many combined parse failures (no price/no ASIN/
@@ -130,6 +130,8 @@ def build_snapshot() -> dict:
     )
     providers = get_manager().status_snapshot()
     learning_snapshot = learning.status_snapshot()
+    budget_snapshot = budget.get_snapshot()
+    coverage = budget.get_knowledge_coverage()
     return {
         "status": "delayed" if _is_delayed() else "ok",
         "uptime_seconds": _uptime_seconds(),
@@ -144,6 +146,8 @@ def build_snapshot() -> dict:
         "active_duplicate_entries": dedup.get_active_count(),
         "providers": providers,
         "learning": learning_snapshot,
+        "budget": budget_snapshot,
+        "knowledge_coverage": coverage,
         "channel_health": get_channel_health(),
         "replay": replay.get_status(),
         "pid": os.getpid(),
@@ -186,6 +190,35 @@ def _format_channel_health(channel_health: list[dict]) -> list[str]:
         if ch["minutes_since_last_post"] is not None:
             lines.append(f"Last post: {int(ch['minutes_since_last_post'])} min ago")
     return lines
+
+
+def _format_budget_section(b) -> list[str]:
+    return [
+        "🧠 Budget",
+        f"Daily budget: {b.daily_budget}",
+        f"Used: {b.used_today}",
+        f"Remaining: {b.remaining}",
+        f"Projected exhaustion: {b.projected_exhaustion or 'not projected'}",
+        f"Budget/hour: {b.target_calls_per_hour:.0f}",
+        f"Deals/hour: {b.deals_per_hour:.1f}",
+        f"AI calls/hour: {b.calls_per_hour:.1f}",
+        f"AI calls saved today: {b.calls_saved_today}",
+        f"Reserve floor: {b.reserve_floor}",
+        f"Current confidence threshold: {b.confidence_threshold_display:.0%}",
+        f"Priority 1 today: {b.priority_1_count}",
+        f"Priority 2 today: {b.priority_2_count}",
+        f"Priority 3 today: {b.priority_3_count}",
+    ]
+
+
+def _format_knowledge_coverage_section(c) -> list[str]:
+    return [
+        "📚 Knowledge coverage",
+        f"Brands learned: {c.brands_learned}",
+        f"Families learned: {c.families_learned}",
+        f"Categories learned: {c.categories_learned}",
+        f"Estimated AI reduction: {c.estimated_ai_reduction_percent:.0f}%",
+    ]
 
 
 def format_status_message() -> str:
@@ -259,6 +292,10 @@ def format_status_message() -> str:
         f"🎯 AI calls saved today: {learning_snapshot['ai_calls_saved_today']}",
         f"Learning confidence average: {learning_snapshot['avg_confidence']:.0%}",
         f"Knowledge base version: {learning_snapshot['kb_version']}",
+        "",
+        *_format_budget_section(snapshot["budget"]),
+        "",
+        *_format_knowledge_coverage_section(snapshot["knowledge_coverage"]),
         "",
         "📡 Channels",
         *_format_channel_health(snapshot["channel_health"]),

@@ -118,3 +118,47 @@ FAMILY_AI_MATCH_FLOOR = float(os.getenv("FAMILY_AI_MATCH_FLOOR", "0.55"))
 # it's a genuine price/discount change worth notifying about.
 FAMILY_DUPLICATE_PRICE_TOLERANCE_EGP = float(os.getenv("FAMILY_DUPLICATE_PRICE_TOLERANCE_EGP", "1.0"))
 FAMILY_DUPLICATE_DISCOUNT_TOLERANCE_PERCENT = int(os.getenv("FAMILY_DUPLICATE_DISCOUNT_TOLERANCE_PERCENT", "2"))
+
+# Daily AI budget manager (listener/budget.py) -- paces AI usage across the
+# whole day instead of spending until quota exhausts within a few hours.
+# DAILY_ANALYSIS_CAP (above) is the total daily budget being paced against;
+# previously it was declared but never actually enforced anywhere.
+# BUDGET_RESERVE_PERCENT of the daily budget is never spent except by
+# Priority 1 deals, so a late-day surge of genuinely important deals is
+# never starved by earlier spending.
+BUDGET_RESERVE_PERCENT = float(os.getenv("BUDGET_RESERVE_PERCENT", "10"))
+# Priority 3 ("usually skip") is only allowed to spend AI when the remaining
+# budget is comfortably above the reserve -- this multiple of reserve_floor.
+PRIORITY3_HEALTHY_BUDGET_MULTIPLIER = float(os.getenv("PRIORITY3_HEALTHY_BUDGET_MULTIPLIER", "3"))
+# Priority-tier discount thresholds (percent).
+PRIORITY1_DISCOUNT_THRESHOLD = int(os.getenv("PRIORITY1_DISCOUNT_THRESHOLD", "40"))
+PRIORITY2_DISCOUNT_THRESHOLD = int(os.getenv("PRIORITY2_DISCOUNT_THRESHOLD", "20"))
+# A learned rule below this confidence is always treated as Priority 1
+# ("learned confidence below threshold") -- mirrors learning.py's own
+# always-call-AI floor (see learning._confidence_band_ai_probability).
+PRIORITY1_RULE_CONFIDENCE_FLOOR = float(os.getenv("PRIORITY1_RULE_CONFIDENCE_FLOOR", "0.70"))
+# A rule at/above this confidence is "well understood" -> Priority 3;
+# between the floor above and this value -> Priority 2 ("moderate confidence").
+PRIORITY3_RULE_CONFIDENCE_CEILING = float(os.getenv("PRIORITY3_RULE_CONFIDENCE_CEILING", "0.90"))
+# Floor for the budget-adaptive validation-probability multiplier (see
+# learning.decide()'s validation_multiplier param) -- even at a fully
+# exhausted budget, a tiny chance of AI validation is kept so the knowledge
+# base never goes completely stale.
+BUDGET_MIN_VALIDATION_MULTIPLIER = float(os.getenv("BUDGET_MIN_VALIDATION_MULTIPLIER", "0.05"))
+
+# Product Family AI-verdict cache (listener/family.py) -- reuses a family's
+# most recent real AI verdict for a new variant instead of spending another
+# AI call, unless price/discount moved significantly or a genuinely new kind
+# of variant attribute appeared.
+FAMILY_VERDICT_CACHE_WINDOW_HOURS = float(os.getenv("FAMILY_VERDICT_CACHE_WINDOW_HOURS", "12"))
+FAMILY_VERDICT_PRICE_CHANGE_THRESHOLD_PERCENT = float(os.getenv("FAMILY_VERDICT_PRICE_CHANGE_THRESHOLD_PERCENT", "10"))
+FAMILY_VERDICT_DISCOUNT_CHANGE_THRESHOLD_PERCENT = float(
+    os.getenv("FAMILY_VERDICT_DISCOUNT_CHANGE_THRESHOLD_PERCENT", "10")
+)
+# Once a family has this many known variants, only every Nth new variant (or
+# one per SMART_SAMPLING_INTERVAL_HOURS, whichever comes first) forces a
+# real AI call even if the verdict cache would otherwise apply -- keeps a
+# well-learned family from drifting silently out of date.
+SMART_SAMPLING_VARIANT_THRESHOLD = int(os.getenv("SMART_SAMPLING_VARIANT_THRESHOLD", "10"))
+SMART_SAMPLING_EVERY_N_VARIANTS = int(os.getenv("SMART_SAMPLING_EVERY_N_VARIANTS", "10"))
+SMART_SAMPLING_INTERVAL_HOURS = float(os.getenv("SMART_SAMPLING_INTERVAL_HOURS", "6"))
